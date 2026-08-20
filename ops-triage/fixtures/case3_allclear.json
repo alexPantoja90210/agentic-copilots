@@ -1,0 +1,16 @@
+{
+  "window": "last_30m",
+  "services": ["checkout-api", "payments-db", "search-svc"],
+  "alerts": [],
+  "metrics": [
+    {"id": "M-1", "service": "checkout-api", "name": "error_rate", "value": 0.008, "baseline": 0.01},
+    {"id": "M-2", "service": "payments-db", "name": "cpu", "value": 0.44, "baseline": 0.45},
+    {"id": "M-3", "service": "search-svc", "name": "error_rate", "value": 0.004, "baseline": 0.005}
+  ],
+  "recent_changes": [
+    {"id": "CH-1", "service": "search-svc", "type": "config", "at": "T-5h", "summary": "search-svc cache TTL change"}
+  ],
+  "runbook": [
+    {"cause_type": "none", "proposed_step": "No incident - continue monitoring."}
+  ]
+}

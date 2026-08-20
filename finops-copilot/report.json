@@ -1,0 +1,22 @@
+{
+  "generated_at": "2026-08-19",
+  "region": "us-east-1",
+  "forecast": 0.00,
+  "budget": 5.00,
+  "budget_status": "on_track",
+  "health_score": 82,
+  "waste": [
+    {
+      "resource": "Elastic IP eipalloc-0abc123",
+      "type": "unused_elastic_ip",
+      "monthly_cost": 3.65,
+      "fix": "Release the unused Elastic IP"
+    },
+    {
+      "resource": "EBS volume vol-0def456",
+      "type": "unattached_ebs",
+      "monthly_cost": 0.80,
+      "fix": "Delete or snapshot the unattached volume"
+    }
+  ]
+}

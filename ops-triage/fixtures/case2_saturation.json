@@ -1,0 +1,18 @@
+{
+  "window": "last_30m",
+  "services": ["orders-api", "cart-svc", "cdn-edge"],
+  "alerts": [
+    {"id": "AL-1", "service": "orders-api", "signal": "cpu", "severity": "critical", "value": 0.98, "threshold": 0.85, "first_seen": "T-14m"},
+    {"id": "AL-2", "service": "cart-svc", "signal": "error_rate", "severity": "major", "value": 0.08, "threshold": 0.05, "first_seen": "T-6m"}
+  ],
+  "metrics": [
+    {"id": "M-1", "service": "orders-api", "name": "cpu", "value": 0.98, "baseline": 0.55},
+    {"id": "M-2", "service": "orders-api", "name": "req_per_s", "value": 4200, "baseline": 1500},
+    {"id": "M-3", "service": "cart-svc", "name": "error_rate", "value": 0.08, "baseline": 0.02}
+  ],
+  "recent_changes": [],
+  "runbook": [
+    {"cause_type": "resource_saturation", "proposed_step": "Propose scaling orders-api or shedding load; confirm with the owning team before acting."},
+    {"cause_type": "downstream_dependency", "proposed_step": "Propose checking cart-svc's dependency on orders-api before any change."}
+  ]
+}

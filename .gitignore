@@ -1,0 +1,11 @@
+# Python
+.venv/
+__pycache__/
+*.pyc
+
+# secrets / env
+.env
+
+# generated run outputs (kept out of source; regenerated on each run)
+triage_plan.json
+incident_brief.md

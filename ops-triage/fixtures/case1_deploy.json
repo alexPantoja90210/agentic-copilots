@@ -1,0 +1,24 @@
+{
+  "window": "last_30m",
+  "services": ["checkout-api", "payments-db", "search-svc"],
+  "alerts": [
+    {"id": "AL-1", "service": "checkout-api", "signal": "error_rate", "severity": "critical", "value": 0.42, "threshold": 0.05, "first_seen": "T-8m"},
+    {"id": "AL-2", "service": "checkout-api", "signal": "latency_p99_ms", "severity": "major", "value": 2200, "threshold": 800, "first_seen": "T-7m"},
+    {"id": "AL-3", "service": "payments-db", "signal": "cpu", "severity": "major", "value": 0.93, "threshold": 0.85, "first_seen": "T-25m"}
+  ],
+  "metrics": [
+    {"id": "M-1", "service": "checkout-api", "name": "error_rate", "value": 0.42, "baseline": 0.01},
+    {"id": "M-2", "service": "checkout-api", "name": "latency_p99_ms", "value": 2200, "baseline": 600},
+    {"id": "M-3", "service": "payments-db", "name": "cpu", "value": 0.93, "baseline": 0.45},
+    {"id": "M-4", "service": "search-svc", "name": "error_rate", "value": 0.004, "baseline": 0.005}
+  ],
+  "recent_changes": [
+    {"id": "CH-1", "service": "checkout-api", "type": "deploy", "at": "T-10m", "summary": "checkout-api v2.3.1 rollout"},
+    {"id": "CH-2", "service": "search-svc", "type": "config", "at": "T-3h", "summary": "search-svc cache TTL change"}
+  ],
+  "runbook": [
+    {"cause_type": "bad_deploy", "proposed_step": "Propose a canary rollback of the most recent deploy and re-check error rate before any wider action."},
+    {"cause_type": "resource_saturation", "proposed_step": "Propose scaling the saturated resource or shedding load; confirm with the owning team before acting."},
+    {"cause_type": "config_change", "proposed_step": "Propose reverting the recent config change in a canary and compare against baseline."}
+  ]
+}
