@@ -1,4 +1,6 @@
 .venv/
 __pycache__/
 *.pyc
-.env
+.envaction_plan.json
+exec_brief.md
+report.real.json
