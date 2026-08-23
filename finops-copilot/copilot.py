@@ -8,6 +8,8 @@ import json
 import os
 from anthropic import Anthropic
 
+from report_contract import ReportContractError, describe_problems, validate_report
+
 # Pick a current model from https://docs.claude.com/en/docs/about-claude/models
 MODEL = os.environ.get("COPILOT_MODEL", "claude-sonnet-4-5")
 client = Anthropic()  # reads ANTHROPIC_API_KEY from the environment
@@ -15,32 +17,64 @@ client = Anthropic()  # reads ANTHROPIC_API_KEY from the environment
 REPORT = {}
 
 def load_report(path="report.json"):
+    """
+    Carga el reporte y EXIGE que cumpla el contrato.
+
+    Antes de IA-26 esta funcion aceptaba cualquier JSON. Si el reporte traia
+    otra forma, las tools devolvian None en silencio y el modelo rellenaba el
+    hueco por su cuenta: el resultado salia bien por iniciativa del modelo, no
+    porque el codigo funcionara. Ahora falla ruidosamente y de inmediato.
+    """
     global REPORT
     with open(path) as f:
-        REPORT = json.load(f)
+        data = json.load(f)
+    problems = validate_report(data)
+    if problems:
+        raise ReportContractError(describe_problems(path, problems))
+    REPORT = data
     return REPORT
 
 # ---------- read-only tools (none of these change anything) ----------
 def get_costs(_a):
+    forecast = REPORT.get("forecast", {})
     return {
-        "projected_month_end_usd": REPORT.get("forecast"),
-        "budget_usd": REPORT.get("budget"),
-        "budget_status": REPORT.get("budget_status"),
+        "projected_month_end_usd": forecast.get("projected_eom"),
+        "month_to_date_usd": forecast.get("mtd"),
+        "budget_usd": forecast.get("budget"),
+        "budget_status": forecast.get("status"),
         "health_score": REPORT.get("health_score"),
     }
 
 def list_waste(_a):
-    return REPORT.get("waste", [])
+    """
+    Traduce el vocabulario del REPORTE al vocabulario del PLAN, en codigo.
+
+    El reporte dice est_monthly_usd/action; el plan dice monthly_cost_usd/fix.
+    Son dos contratos distintos y esta bien que lo sean — lo que no esta bien
+    es que la traduccion la hiciera el modelo, como ocurria antes de IA-26.
+    Traducir aqui la vuelve explicita, unica y verificable.
+    """
+    return [
+        {
+            "resource": w.get("resource"),
+            "type": w.get("type"),
+            "detail": w.get("detail"),
+            "monthly_cost_usd": w.get("est_monthly_usd"),
+            "fix": w.get("action"),
+        }
+        for w in REPORT.get("waste", [])
+    ]
 
 def get_budget(_a):
-    return {"budget_usd": REPORT.get("budget"), "status": REPORT.get("budget_status")}
+    forecast = REPORT.get("forecast", {})
+    return {"budget_usd": forecast.get("budget"), "status": forecast.get("status")}
 
 TOOL_FUNCS = {"get_costs": get_costs, "list_waste": list_waste, "get_budget": get_budget}
 
 READ_TOOLS = [
-    {"name": "get_costs", "description": "Get projected month-end spend, budget, status and health score.",
+    {"name": "get_costs", "description": "Get month-to-date spend, projected month-end spend, budget, status and health score.",
      "input_schema": {"type": "object", "properties": {}}},
-    {"name": "list_waste", "description": "List detected waste items, each with monthly_cost (USD) and the recommended fix.",
+    {"name": "list_waste", "description": "List detected waste items, each with monthly_cost_usd (USD) and the recommended fix.",
      "input_schema": {"type": "object", "properties": {}}},
     {"name": "get_budget", "description": "Get the budget guardrail and current status.",
      "input_schema": {"type": "object", "properties": {}}},
@@ -131,6 +165,9 @@ def plan(write_files=True):
                                     "content": json.dumps(TOOL_FUNCS[block.name](block.input))})
         if submitted is not None:
             # Guardrail in code: derive top_action from the ranked list so it is always self-consistent.
+            # NOTA (IA-27): esto ordena la salida del modelo, no el dato de origen.
+            # Es mas debil de lo que la narrativa del proyecto afirma. Se corrige
+            # en IA-27; aqui se deja intacto a proposito para no mezclar alcances.
             ranked = sorted(submitted.get("ranked_actions", []) or [],
                             key=lambda a: a.get("monthly_cost_usd", 0), reverse=True)
             submitted["ranked_actions"] = ranked

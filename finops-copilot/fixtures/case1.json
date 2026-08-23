@@ -1,5 +1,30 @@
-{"forecast":0.00,"budget":5.00,"budget_status":"on_track","health_score":82,
- "waste":[
-   {"resource":"Elastic IP eipalloc-0abc123","type":"unused_elastic_ip","monthly_cost":3.65,"fix":"Release the unused Elastic IP"},
-   {"resource":"EBS volume vol-0def456","type":"unattached_ebs","monthly_cost":0.80,"fix":"Delete or snapshot the unattached volume"}
- ]}
+{
+  "generated_at": "2026-08-19T00:00:00+00:00",
+  "forecast": {
+    "mtd": 0.0,
+    "avg_daily": 0.0,
+    "projected_eom": 0.0,
+    "budget": 5.0,
+    "status": "OK",
+    "days": "19/31",
+    "data_ok": true
+  },
+  "waste": [
+    {
+      "type": "unused_elastic_ip",
+      "resource": "Elastic IP eipalloc-0abc123",
+      "detail": "unattached for 14 days",
+      "est_monthly_usd": 3.65,
+      "action": "Release the unused Elastic IP"
+    },
+    {
+      "type": "unattached_ebs",
+      "resource": "EBS volume vol-0def456",
+      "detail": "8 GiB gp3, unattached",
+      "est_monthly_usd": 0.8,
+      "action": "Delete or snapshot the unattached volume"
+    }
+  ],
+  "waste_monthly_usd": 4.45,
+  "health_score": 82
+}

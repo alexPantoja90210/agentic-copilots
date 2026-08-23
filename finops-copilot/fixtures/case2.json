@@ -1,6 +1,37 @@
-{"forecast":12.40,"budget":20.00,"budget_status":"on_track","health_score":74,
- "waste":[
-   {"resource":"EC2 i-0idle999","type":"idle_ec2","monthly_cost":7.50,"fix":"Stop or right-size the idle instance"},
-   {"resource":"Elastic IP eipalloc-0zzz","type":"unused_elastic_ip","monthly_cost":3.65,"fix":"Release the unused Elastic IP"},
-   {"resource":"EBS volume vol-0old","type":"unattached_ebs","monthly_cost":1.20,"fix":"Delete or snapshot the unattached volume"}
- ]}
+{
+  "generated_at": "2026-08-19T00:00:00+00:00",
+  "forecast": {
+    "mtd": 8.8,
+    "avg_daily": 0.4,
+    "projected_eom": 12.4,
+    "budget": 20.0,
+    "status": "OK",
+    "days": "22/31",
+    "data_ok": true
+  },
+  "waste": [
+    {
+      "type": "idle_ec2",
+      "resource": "EC2 i-0idle999",
+      "detail": "t3.micro, avg CPU 1.8%",
+      "est_monthly_usd": 7.5,
+      "action": "Stop or right-size the idle instance"
+    },
+    {
+      "type": "unused_elastic_ip",
+      "resource": "Elastic IP eipalloc-0zzz",
+      "detail": "unattached for 9 days",
+      "est_monthly_usd": 3.65,
+      "action": "Release the unused Elastic IP"
+    },
+    {
+      "type": "unattached_ebs",
+      "resource": "EBS volume vol-0old",
+      "detail": "12 GiB gp2, unattached",
+      "est_monthly_usd": 1.2,
+      "action": "Delete or snapshot the unattached volume"
+    }
+  ],
+  "waste_monthly_usd": 12.35,
+  "health_score": 74
+}

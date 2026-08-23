@@ -1,1 +1,15 @@
-{"forecast":0.00,"budget":5.00,"budget_status":"on_track","health_score":100,"waste":[]}
+{
+  "generated_at": "2026-08-19T00:00:00+00:00",
+  "forecast": {
+    "mtd": 0.0,
+    "avg_daily": 0.0,
+    "projected_eom": 0.0,
+    "budget": 5.0,
+    "status": "OK",
+    "days": "19/31",
+    "data_ok": true
+  },
+  "waste": [],
+  "waste_monthly_usd": 0.0,
+  "health_score": 100
+}
