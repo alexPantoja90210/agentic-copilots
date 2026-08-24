@@ -12,7 +12,17 @@ from report_contract import ReportContractError, describe_problems, validate_rep
 
 # Pick a current model from https://docs.claude.com/en/docs/about-claude/models
 MODEL = os.environ.get("COPILOT_MODEL", "claude-sonnet-4-5")
-client = Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+
+# Cliente perezoso (IA-27): antes se instanciaba al importar, lo que exigia
+# ANTHROPIC_API_KEY solo para poder importar el modulo. El test negativo de
+# IA-27 no llama a la API; debe poder correr gratis y en CI (IA-1).
+_CLIENT = None
+
+def _get_client():
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+    return _CLIENT
 
 REPORT = {}
 
@@ -45,6 +55,31 @@ def get_costs(_a):
         "health_score": REPORT.get("health_score"),
     }
 
+def _cost(action):
+    """Coerciona el costo a float. Lo que no es numero vale 0 y nunca corona."""
+    try:
+        return float(action.get("monthly_cost_usd") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+def _waste_as_actions(report, include_context=False):
+    """
+    Traduccion unica REPORTE -> PLAN. La usan la tool list_waste y la
+    derivacion en codigo de IA-27, para que no puedan divergir entre si.
+    """
+    out = []
+    for w in report.get("waste", []) or []:
+        action = {
+            "resource": w.get("resource"),
+            "monthly_cost_usd": w.get("est_monthly_usd"),
+            "fix": w.get("action"),
+        }
+        if include_context:
+            action["type"] = w.get("type")
+            action["detail"] = w.get("detail")
+        out.append(action)
+    return out
+
 def list_waste(_a):
     """
     Traduce el vocabulario del REPORTE al vocabulario del PLAN, en codigo.
@@ -54,16 +89,7 @@ def list_waste(_a):
     es que la traduccion la hiciera el modelo, como ocurria antes de IA-26.
     Traducir aqui la vuelve explicita, unica y verificable.
     """
-    return [
-        {
-            "resource": w.get("resource"),
-            "type": w.get("type"),
-            "detail": w.get("detail"),
-            "monthly_cost_usd": w.get("est_monthly_usd"),
-            "fix": w.get("action"),
-        }
-        for w in REPORT.get("waste", [])
-    ]
+    return _waste_as_actions(REPORT, include_context=True)
 
 def get_budget(_a):
     forecast = REPORT.get("forecast", {})
@@ -126,7 +152,7 @@ SYSTEM = (
 )
 
 def _run(messages, tools):
-    return client.messages.create(model=MODEL, max_tokens=1024, system=SYSTEM, tools=tools, messages=messages)
+    return _get_client().messages.create(model=MODEL, max_tokens=1024, system=SYSTEM, tools=tools, messages=messages)
 
 def ask(question, verbose=True):
     """Phase 0/1: free-form Q&A over the data (read-only)."""
@@ -145,8 +171,80 @@ def ask(question, verbose=True):
                                 "content": json.dumps(TOOL_FUNCS[block.name](block.input))})
         messages.append({"role": "user", "content": results})
 
-def plan(write_files=True):
-    """Phase 2: agent reads the data and submits a structured action plan."""
+
+# ---------- IA-27: el codigo es dueno de los numeros; el modelo, del lenguaje ----------
+def build_ranked_actions(report, submitted=None):
+    """
+    Construye ranked_actions DESDE report["waste"], no desde la salida del modelo.
+
+    Antes de IA-27 se ordenaba submitted["ranked_actions"], que es lo que el
+    modelo entrego. Eso garantizaba auto-consistencia (el top era el maximo de
+    su propia lista) pero no correccion: si el modelo omitia un item o copiaba
+    mal una cifra, el codigo ordenaba una lista corrompida con total seguridad.
+
+    Ahora:
+      - resource, monthly_cost_usd y el ORDEN salen del reporte. Punto.
+      - la REDACCION del fix se injerta del modelo cuando escribio algo para
+        ese mismo resource; si no, cae al "action" del reporte.
+      - un resource que no existe en el reporte no entra en la lista, y por lo
+        tanto no puede coronarse. Es la verificacion de plausibilidad que
+        ops-triage/triage.py ya implementaba con _severity_score(...) > 0.
+    """
+    model_wording = {}
+    for a in (submitted or {}).get("ranked_actions") or []:
+        if not isinstance(a, dict):
+            continue
+        resource, fix = a.get("resource"), a.get("fix")
+        if resource and isinstance(fix, str) and fix.strip():
+            model_wording.setdefault(resource, fix.strip())
+
+    ranked = []
+    for item in _waste_as_actions(report):
+        action = dict(item)
+        wording = model_wording.get(action.get("resource"))
+        if wording:
+            action["fix"] = wording
+        ranked.append(action)
+
+    # Desempate por resource: mismo reporte -> mismo orden, siempre.
+    ranked.sort(key=lambda a: (-_cost(a), str(a.get("resource") or "")))
+    return ranked
+
+def enforce_source_of_truth(submitted, report=None):
+    """Aplica la derivacion en codigo sobre el plan que entrego el modelo."""
+    report = REPORT if report is None else report
+    ranked = build_ranked_actions(report, submitted)
+    submitted["ranked_actions"] = ranked
+    submitted["total_monthly_waste_usd"] = round(sum(_cost(a) for a in ranked), 2)
+    if ranked and _cost(ranked[0]) > 0:
+        submitted["top_action"] = ranked[0]
+    else:
+        submitted.pop("top_action", None)
+    return submitted
+
+def legacy_guardrail(submitted, report=None):
+    """
+    El guardrail ANTERIOR a IA-27, conservado a proposito.
+
+    No se usa en produccion. Existe para que el test negativo pueda demostrar
+    en ROJO lo que este ordenamiento no protege, y para poder explicar el antes
+    y el despues sin recurrir al historial de git.
+    """
+    ranked = sorted(submitted.get("ranked_actions", []) or [],
+                    key=lambda a: a.get("monthly_cost_usd", 0), reverse=True)
+    submitted["ranked_actions"] = ranked
+    if ranked:
+        submitted["top_action"] = ranked[0]
+    else:
+        submitted.pop("top_action", None)
+    return submitted
+
+def plan(write_files=True, enforce=True):
+    """Phase 2: agent reads the data and submits a structured action plan.
+
+    enforce=False desactiva la re-derivacion de IA-27 y vuelve al guardrail
+    anterior. Existe para que el test negativo pueda salir en ROJO.
+    """
     tools = READ_TOOLS + [SUBMIT_PLAN_TOOL]
     messages = [{"role": "user", "content":
                  "Read the cost and waste data with the tools, then call submit_plan with the prioritized plan."}]
@@ -164,17 +262,13 @@ def plan(write_files=True):
                     results.append({"type": "tool_result", "tool_use_id": block.id,
                                     "content": json.dumps(TOOL_FUNCS[block.name](block.input))})
         if submitted is not None:
-            # Guardrail in code: derive top_action from the ranked list so it is always self-consistent.
-            # NOTA (IA-27): esto ordena la salida del modelo, no el dato de origen.
-            # Es mas debil de lo que la narrativa del proyecto afirma. Se corrige
-            # en IA-27; aqui se deja intacto a proposito para no mezclar alcances.
-            ranked = sorted(submitted.get("ranked_actions", []) or [],
-                            key=lambda a: a.get("monthly_cost_usd", 0), reverse=True)
-            submitted["ranked_actions"] = ranked
-            if ranked:
-                submitted["top_action"] = ranked[0]
+            # Guardrail in code (IA-27): ranked_actions, el total y el top_action
+            # se re-derivan desde REPORT["waste"]. El modelo no es dueno de
+            # ninguna cifra ni del orden; solo de como se redacta cada cosa.
+            if enforce:
+                enforce_source_of_truth(submitted)
             else:
-                submitted.pop("top_action", None)
+                legacy_guardrail(submitted)  # solo para el test negativo
             if write_files:
                 with open("action_plan.json", "w") as f:
                     json.dump(submitted, f, indent=2)
