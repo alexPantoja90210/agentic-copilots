@@ -1,0 +1,87 @@
+# IA-1 — the GREEN/RED gate for both agents.
+#
+# Two jobs on purpose:
+#
+#   gate  — runs on every push and pull request. Only `evals.py --selftest`,
+#           which makes NO API calls: it is free, deterministic, and it is what
+#           a gate should be. It validates the checkers themselves, including
+#           the negative tests that must go RED.
+#
+#   live  — manual only (Actions → Run workflow). It calls the real model over
+#           the fixtures and therefore costs money. Running it on every push
+#           would spend API budget on every typo, so it is opt-in.
+#
+# A gate that only ever passes is worthless. These selftests assert both
+# directions: the good plan passes, and the deliberately broken one fails.
+
+name: evals
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: selftest (${{ matrix.agent }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: [finops-copilot, ops-triage]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      # finops-copilot/evals.py imports copilot.py to exercise the IA-27
+      # derivation checks. The import needs the package present, but NOT an
+      # API key: the client is instantiated lazily and no request is made.
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip anthropic
+
+      - name: Run selftest
+        working-directory: ${{ matrix.agent }}
+        run: python evals.py --selftest
+
+  live:
+    name: live gate (${{ matrix.agent }}) — costs API
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    needs: gate
+    strategy:
+      fail-fast: false
+      matrix:
+        agent: [finops-copilot, ops-triage]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip anthropic
+
+      - name: Require the API key
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not set. Add it under Settings → Secrets and variables → Actions."
+            exit 1
+          fi
+
+      - name: Run the fixture gate against the live model
+        working-directory: ${{ matrix.agent }}
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python evals.py

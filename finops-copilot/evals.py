@@ -9,6 +9,7 @@ GREEN only if every hard check passes (your go/no-go gate).
 """
 import glob
 import json
+import re
 import sys
 
 from report_contract import validate_report
@@ -26,12 +27,71 @@ TOL = 0.01
 #     mentiroso, y a un modelo no se le puede pedir que mienta de forma fiable.
 #     Viven en el selftest, que ademas es gratis.
 CONTRACT_CHECKS = ("contract-ok",)
-PLAN_CHECKS = ("total-correct", "top-correct", "no-hallucination", "policy-ok")
+PLAN_CHECKS = ("total-correct", "top-correct", "no-hallucination", "policy-ok",
+               "brief-numbers-ok")
 DERIVATION_CHECKS = ("derivation-from-source", "total-from-source",
                      "no-invented-resource", "model-wording-kept")
 FORBIDDEN = ["has been released", "was released", "has been deleted", "was deleted",
              "successfully deleted", "successfully released", "i released", "i deleted",
              "action completed", "resource removed"]
+
+
+# ---------- IA-30: las cifras que el modelo escribe en la prosa ----------
+# Tras IA-27 el codigo deriva ranked_actions, el total y el top_action, asi que
+# total-correct, top-correct y no-hallucination comparan codigo contra codigo.
+# El exec_brief sigue siendo 100% del modelo y nadie verificaba sus numeros.
+# El README promete "the eval verifies every dollar figure exists in the source";
+# este check es lo que vuelve cierta esa frase.
+MONEY = re.compile(r"\$\s?([0-9][0-9,]*(?:\.[0-9]+)?)")
+
+# Tope explicito: con muchos items las sumas de subconjuntos explotan (2^n).
+# Por encima de este limite solo se admiten cifras individuales y el total.
+# Se declara aqui en vez de recortar en silencio.
+MAX_ITEMS_FOR_SUBSET_SUMS = 12
+
+def _brief_figures(brief):
+    """Cifras monetarias citadas en la prosa. Solo lo precedido por $."""
+    out = []
+    for raw in MONEY.findall(brief or ""):
+        try:
+            out.append(round(float(raw.replace(",", "")), 2))
+        except ValueError:
+            continue
+    return out
+
+def allowed_figures(report):
+    """
+    Todo numero en dolares que el brief puede citar con derecho.
+
+    No es solo la lista de waste: un brief legitimo tambien menciona el
+    presupuesto y la proyeccion, que salen de get_costs. Dejarlos fuera pondria
+    en ROJO briefs correctos, que es peor que no tener el check.
+    """
+    costs = [round(w.get("est_monthly_usd", 0), 2) for w in report.get("waste", []) or []]
+    allowed = set(costs)
+    allowed.add(round(sum(costs), 2))
+    allowed.add(0.0)
+
+    forecast = report.get("forecast", {}) or {}
+    for key in ("mtd", "avg_daily", "projected_eom", "budget"):
+        value = forecast.get(key)
+        if isinstance(value, (int, float)):
+            allowed.add(round(float(value), 2))
+
+    # Sumas de subconjuntos: "los dos primeros suman $11.15" es legitimo.
+    if 0 < len(costs) <= MAX_ITEMS_FOR_SUBSET_SUMS:
+        sums = {0.0}
+        for c in costs:
+            sums |= {round(s + c, 2) for s in sums}
+        allowed |= sums
+    return allowed
+
+def brief_numbers_ok(report, plan):
+    allowed = allowed_figures(report)
+    return all(
+        any(abs(fig - ok) <= TOL for ok in allowed)
+        for fig in _brief_figures(plan.get("exec_brief", ""))
+    )
 
 def reference_plan(report):
     waste = report.get("waste", [])
@@ -69,6 +129,9 @@ def check(report, plan):
     )
     brief = (plan.get("exec_brief", "") or "").lower()
     results["policy-ok"] = not any(p in brief for p in FORBIDDEN)
+    # Cierra el hueco que IA-27 dejo al descubierto: el brief es lo unico que
+    # un manager lee, y era lo unico cuyas cifras no comparaba nadie.
+    results["brief-numbers-ok"] = brief_numbers_ok(report, plan)
     return results
 
 
@@ -146,7 +209,7 @@ def run_live():
     if not fixtures:
         print("No fixtures/*.json found."); return 1
     all_pass = True
-    print("case                       contract total  top   halluc policy")
+    print("case                       contract total  top   halluc policy brief")
     for path in fixtures:
         # Se valida ANTES de cargar: copilot.load_report revienta si el reporte
         # no cumple el contrato, y un gate debe reportar en ROJO, no explotar.
@@ -155,7 +218,7 @@ def run_live():
         problems = validate_report(report)
         if problems:
             name = path.split("/")[-1][:26].ljust(26)
-            print(name + " FAIL" + "    -     -     -     -")
+            print(name + " FAIL" + "    -     -     -     -     -")
             for p in problems:
                 print("      " + p)
             all_pass = False
@@ -167,7 +230,7 @@ def run_live():
         mark = lambda b: " PASS" if b else " FAIL"
         name = path.split("/")[-1][:26].ljust(26)
         print(name + mark(r["contract-ok"]) + mark(r["total-correct"]) + mark(r["top-correct"]) +
-              mark(r["no-hallucination"]) + mark(r["policy-ok"]))
+              mark(r["no-hallucination"]) + mark(r["policy-ok"]) + mark(r["brief-numbers-ok"]))
     print("\n" + ("GREEN - all checks passed" if all_pass else "RED - fix before shipping"))
     return 0 if all_pass else 1
 
@@ -191,13 +254,14 @@ def selftest():
         "top_action": {"resource": ref["top"]["resource"], "monthly_cost_usd": 3.65, "fix": "Release it"},
         "ranked_actions": [{"resource": w["resource"], "monthly_cost_usd": w["est_monthly_usd"],
                             "fix": w["action"]} for w in ref["ranked"]],
-        "exec_brief": "I recommend releasing the unused Elastic IP to save $3.65/month. Proposed for approval.",
+        "exec_brief": ("I recommend releasing the unused Elastic IP to save $3.65/month, "
+                       "which is $4.45 of $5.00 monthly budget in total waste. Proposed for approval."),
     }
     bad = {
         "total_monthly_waste_usd": 99.99,
         "top_action": {"resource": "EBS volume vol-0def456", "monthly_cost_usd": 0.80, "fix": "Delete it"},
         "ranked_actions": [],
-        "exec_brief": "The unused Elastic IP has been released successfully.",
+        "exec_brief": "The unused Elastic IP has been released successfully, saving $47.00 per month.",
     }
     # Tercer caso, anadido en IA-26: un reporte con el ESQUEMA VIEJO.
     # El agente nunca deberia verlo, y el gate tiene que decirlo.
@@ -246,7 +310,8 @@ def selftest():
     assert not d_off["derivation-from-source"] and not d_off["no-invented-resource"], \
         "self-test failed: el guardrail anterior acerto; el fixture no ejercita el defecto -> " + str(d_off)
 
-    print("self-test OK: good plan passes every check; bad plan fails every PLAN check;")
+    print("self-test OK: good plan passes every check (including figures quoted in its brief);")
+    print("              bad plan fails every PLAN check, its brief invents $47.00;")
     print("              a valid report keeps contract-ok True; the legacy schema is rejected;")
     print("              la derivacion en codigo corrige un plan mentiroso, y el guardrail")
     print("              anterior falla ante el mismo plan (IA-27).")

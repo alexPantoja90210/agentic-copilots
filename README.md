@@ -12,11 +12,11 @@ Two hands-on agentic AI projects that share **one design**. The domain changes; 
 | Ranks | waste by $ / month | causes by severity × change-correlation |
 | Proposes | a savings action for approval | a runbook step for approval |
 | Invariant in code | `top_action` = highest-cost item **in the source report** | `top_cause` = highest-severity service |
-| Eval checks | contract · total · top · no-hallucination · policy · derivation | top · no-hallucination · evidence · policy |
+| Eval checks | contract · total · top · no-hallucination · policy · brief-numbers · derivation | top · no-hallucination · evidence · policy |
 
 ## The five invariants (kept in both)
 1. **Read-only tools only** — the agent can see everything and change nothing. Safety is structural, not prompted.
-2. **No invented data** — the eval checks every figure/id in the plan exists in the source.
+2. **No invented data** — the eval checks every figure/id in the plan exists in the source, and every dollar figure quoted in the executive brief too.
 3. **Grounded** — every claim cites real evidence.
 4. **Propose, never execute** — a policy check forbids "done / released / rolled back / restarted" language.
 5. **The fragile invariant lives in code, not the prompt** — the single most important field (the "top" item) is derived in code **from the source data, not from the model's output**. The code owns the figures and the ordering; the model owns the language. That makes the result *correct against the source* — not merely self-consistent with whatever the model happened to submit.
