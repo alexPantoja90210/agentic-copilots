@@ -6,6 +6,7 @@ Requires: pip install anthropic  and  ANTHROPIC_API_KEY in your environment.
 """
 import json
 import os
+import sys
 from anthropic import Anthropic
 
 from report_contract import ReportContractError, describe_problems, validate_report
@@ -13,10 +14,28 @@ from report_contract import ReportContractError, describe_problems, validate_rep
 # Pick a current model from https://docs.claude.com/en/docs/about-claude/models
 MODEL = os.environ.get("COPILOT_MODEL", "claude-sonnet-4-5")
 
+# The per-call output ceiling. It is passed to the API AND to the budget, so the
+# cap projects against the same number the request is actually bounded by.
+# Two copies of this value would drift, and the drift would make the cap lie.
+MAX_OUTPUT_TOKENS = 1024
+
 # Cliente perezoso (IA-27): antes se instanciaba al importar, lo que exigia
 # ANTHROPIC_API_KEY solo para poder importar el modulo. El test negativo de
 # IA-27 no llama a la API; debe poder correr gratis y en CI (IA-1).
 _CLIENT = None
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from agent_budget import (  # noqa: E402  (import after the path shim, by necessity)
+    BudgetExceeded,
+    IterationCapExceeded,
+    RunBudget,
+)
+
+# The budget of the most recent run, so a caller that did not pass its own can
+# still read what the run cost. IA-29: consumption that is not reported is
+# consumption nobody controls.
+LAST_BUDGET = None
+
 
 def _get_client():
     global _CLIENT
@@ -151,20 +170,37 @@ SYSTEM = (
     "(5) If there is no waste, set total_monthly_waste_usd to 0, ranked_actions to an empty list, and do NOT include top_action."
 )
 
-def _run(messages, tools):
-    return _get_client().messages.create(model=MODEL, max_tokens=1024, system=SYSTEM, tools=tools, messages=messages)
+def _run(messages, tools, budget):
+    """
+    The single choke point through which every billed call passes.
 
-def ask(question, verbose=True):
+    The order matters and is the whole point of IA-29: the cap is consulted
+    BEFORE the request. Checking afterwards would only ever produce a receipt.
+    """
+    budget.before_call()
+    resp = _get_client().messages.create(model=MODEL, max_tokens=MAX_OUTPUT_TOKENS,
+                                         system=SYSTEM, tools=tools, messages=messages)
+    budget.record_response(resp)
+    return resp
+
+def ask(question, verbose=True, budget=None):
     """Phase 0/1: free-form Q&A over the data (read-only)."""
+    global LAST_BUDGET
+    budget = budget or RunBudget(MODEL, max_output_per_call=MAX_OUTPUT_TOKENS)
+    LAST_BUDGET = budget
     messages = [{"role": "user", "content": question}]
     while True:
-        resp = _run(messages, READ_TOOLS)
+        budget.begin_iteration()
+        resp = _run(messages, READ_TOOLS, budget)
         if resp.stop_reason != "tool_use":
+            if verbose:
+                print("  [" + budget.summary() + "]")
             return "".join(b.text for b in resp.content if b.type == "text")
         messages.append({"role": "assistant", "content": resp.content})
         results = []
         for block in resp.content:
             if block.type == "tool_use":
+                budget.record_tool(block.name)
                 if verbose:
                     print("  [tool call] " + block.name)
                 results.append({"type": "tool_result", "tool_use_id": block.id,
@@ -239,22 +275,27 @@ def legacy_guardrail(submitted, report=None):
         submitted.pop("top_action", None)
     return submitted
 
-def plan(write_files=True, enforce=True):
+def plan(write_files=True, enforce=True, budget=None, verbose=True):
     """Phase 2: agent reads the data and submits a structured action plan.
 
     enforce=False desactiva la re-derivacion de IA-27 y vuelve al guardrail
     anterior. Existe para que el test negativo pueda salir en ROJO.
     """
+    global LAST_BUDGET
+    budget = budget or RunBudget(MODEL, max_output_per_call=MAX_OUTPUT_TOKENS)
+    LAST_BUDGET = budget
     tools = READ_TOOLS + [SUBMIT_PLAN_TOOL]
     messages = [{"role": "user", "content":
                  "Read the cost and waste data with the tools, then call submit_plan with the prioritized plan."}]
     while True:
-        resp = _run(messages, tools)
+        budget.begin_iteration()
+        resp = _run(messages, tools, budget)
         messages.append({"role": "assistant", "content": resp.content})
         submitted = None
         results = []
         for block in resp.content:
             if block.type == "tool_use":
+                budget.record_tool(block.name)
                 if block.name == "submit_plan":
                     submitted = dict(block.input)
                     results.append({"type": "tool_result", "tool_use_id": block.id, "content": "ok"})
@@ -269,6 +310,8 @@ def plan(write_files=True, enforce=True):
                 enforce_source_of_truth(submitted)
             else:
                 legacy_guardrail(submitted)  # solo para el test negativo
+            if verbose:
+                print("  [" + budget.summary() + "]")
             if write_files:
                 with open("action_plan.json", "w") as f:
                     json.dump(submitted, f, indent=2)

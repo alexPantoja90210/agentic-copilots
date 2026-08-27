@@ -209,6 +209,9 @@ def run_live():
     if not fixtures:
         print("No fixtures/*.json found."); return 1
     all_pass = True
+    # IA-29: a gate whose cost grows silently ends up not being run. Every
+    # fixture's consumption is collected and totalled next to the verdict.
+    budgets = []
     print("case                       contract total  top   halluc policy brief")
     for path in fixtures:
         # Se valida ANTES de cargar: copilot.load_report revienta si el reporte
@@ -224,7 +227,11 @@ def run_live():
             all_pass = False
             continue
         report = copilot.load_report(path)
-        plan = copilot.plan(write_files=False)
+        from agent_budget import RunBudget
+        budget = RunBudget(copilot.MODEL,
+                           max_output_per_call=copilot.MAX_OUTPUT_TOKENS)
+        budgets.append(budget)
+        plan = copilot.plan(write_files=False, budget=budget, verbose=False)
         r = check(report, plan)
         all_pass = all_pass and all(r.values())
         mark = lambda b: " PASS" if b else " FAIL"
@@ -232,7 +239,169 @@ def run_live():
         print(name + mark(r["contract-ok"]) + mark(r["total-correct"]) + mark(r["top-correct"]) +
               mark(r["no-hallucination"]) + mark(r["policy-ok"]) + mark(r["brief-numbers-ok"]))
     print("\n" + ("GREEN - all checks passed" if all_pass else "RED - fix before shipping"))
+
+    if budgets:
+        from agent_budget import merge_reports
+        total = merge_reports([b.report() for b in budgets])
+        cost = total["estimated_cost_usd"]
+        money = "cost unknown" if cost is None else "~$%.4f USD" % cost
+        print("consumption over %d fixture(s): %d iterations, %d calls, "
+              "%d in + %d out = %d tokens, %s"
+              % (total["runs"], total["iterations"], total["calls"],
+                 total["input_tokens"], total["output_tokens"],
+                 total["total_tokens"], money))
+        if cost is not None and not budgets[0].pricing.get("verified"):
+            print("  the figure is an ESTIMATE from model-pricing.json, which "
+                  "declares verified=false. The invoice is the only authority.")
     return 0 if all_pass else 1
+
+
+# ---------------------------------------------------------------------------
+# IA-29: consumption control. These run with NO API key and at NO cost -- the
+# model is replaced by a fake that always asks for another tool and never
+# finishes. That is precisely the failure mode the caps exist for, and it is
+# unreproducible against the real API on demand.
+# ---------------------------------------------------------------------------
+CONSUMPTION_CHECKS = ("iteration-cap-trips", "budget-cap-trips-before-call")
+
+
+class _FakeUsage:
+    def __init__(self, input_tokens, output_tokens):
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
+
+
+class _FakeToolBlock:
+    type = "tool_use"
+
+    def __init__(self, name, index):
+        self.name = name
+        self.input = {}
+        self.id = "toolu_fake_%d" % index
+
+
+class _FakeResponse:
+    stop_reason = "tool_use"
+
+    def __init__(self, name, index, usage):
+        self.content = [_FakeToolBlock(name, index)]
+        self.usage = usage
+
+
+class _FakeMessages:
+    """
+    A model that never calls submit_plan. It keeps asking for a read tool, which
+    is exactly what an agent stuck in a loop looks like from the outside.
+
+    input_tokens grows every turn, because the full history is resent on each
+    call. That growth is the reason an uncapped loop is not merely slow but
+    increasingly expensive.
+    """
+
+    def __init__(self, tool_name, growth=1000):
+        self.tool_name = tool_name
+        self.growth = growth
+        self.calls = 0
+
+    def create(self, **kwargs):
+        self.calls += 1
+        return _FakeResponse(self.tool_name, self.calls,
+                             _FakeUsage(self.growth * self.calls, 200))
+
+
+class _FakeClient:
+    def __init__(self, tool_name, growth=1000):
+        self.messages = _FakeMessages(tool_name, growth)
+
+
+def _with_fake_client(tool_name, growth=1000):
+    """
+    Install the fake and hand back the call counter, so the test can assert how
+    many requests were actually made -- not merely that it stopped.
+
+    copilot is imported here rather than at module scope on purpose: importing
+    it pulls in the anthropic package, and the selftest must keep running on a
+    machine that has neither the package nor an API key.
+    """
+    import copilot
+    fake = _FakeClient(tool_name, growth)
+    copilot._CLIENT = fake
+    return fake
+
+
+def consumption_selftest():
+    """Both caps, each demonstrated by tripping. A limit that has never fired is
+    not a tested limit."""
+    import copilot
+    from agent_budget import BudgetExceeded, IterationCapExceeded, RunBudget
+
+    copilot.load_report("report.json")
+    read_tool = "get_costs"
+    scores = {}
+
+    # ---- 1. iteration cap ----
+    fake = _with_fake_client(read_tool)
+    budget = RunBudget(copilot.MODEL, max_iterations=4,
+                       max_output_per_call=copilot.MAX_OUTPUT_TOKENS)
+    tripped = None
+    try:
+        copilot.plan(write_files=False, budget=budget, verbose=False)
+        raise AssertionError("self-test failed: a model that never submits must "
+                             "hit the iteration cap, not loop forever")
+    except IterationCapExceeded as error:
+        tripped = str(error)
+
+    assert budget.iterations == 4, \
+        "self-test failed: expected exactly 4 iterations, got %d" % budget.iterations
+    assert fake.messages.calls == 4, \
+        "self-test failed: expected exactly 4 billed calls, got %d" % fake.messages.calls
+    for fragment in ("4 iterations", "cap: 4", "tokens", read_tool):
+        assert fragment in tripped, \
+            "self-test failed: the abort message must say how far it got and why. " \
+            "Missing %r in: %s" % (fragment, tripped)
+    scores["iteration-cap-trips"] = True
+    iteration_message = tripped
+
+    # ---- 2. budget cap, checked BEFORE the call ----
+    fake = _with_fake_client(read_tool)
+    budget = RunBudget(copilot.MODEL, max_iterations=100, max_tokens=5000,
+                       max_output_per_call=copilot.MAX_OUTPUT_TOKENS)
+    try:
+        copilot.plan(write_files=False, budget=budget, verbose=False)
+        raise AssertionError("self-test failed: a tiny token cap must abort the run")
+    except BudgetExceeded as error:
+        tripped = str(error)
+
+    # The point of the whole story: the run stopped BEFORE spending past the cap.
+    assert budget.total_tokens <= 5000, \
+        "self-test failed: the cap was crossed before stopping -- %d tokens spent " \
+        "against a cap of 5000. A cap checked after the call is a receipt." \
+        % budget.total_tokens
+    assert fake.messages.calls == budget.calls, \
+        "self-test failed: a request was made that the budget never recorded"
+    assert "was NOT made" in tripped and "5000" in tripped, \
+        "self-test failed: the message must say the call was not made and what the cap was -> %s" % tripped
+    assert budget.iterations < 100, \
+        "self-test failed: it should have stopped on budget, not on iterations"
+    scores["budget-cap-trips-before-call"] = True
+    budget_message = tripped
+
+    # ---- 3. the cap must NOT fire when there is room ----
+    _with_fake_client(read_tool)
+    roomy = RunBudget(copilot.MODEL, max_iterations=2, max_tokens=10_000_000,
+                      max_output_per_call=copilot.MAX_OUTPUT_TOKENS)
+    try:
+        copilot.plan(write_files=False, budget=roomy, verbose=False)
+    except IterationCapExceeded:
+        pass  # expected: it is the iteration cap that ends it, not the budget
+    except BudgetExceeded as error:
+        raise AssertionError("self-test failed: the budget fired with room to "
+                             "spare -- a cap that always trips is as useless as "
+                             "one that never does -> %s" % error)
+
+    copilot._CLIENT = None  # leave no fake behind for anything else
+    return scores, iteration_message, budget_message
+
 
 def selftest():
     report = {
@@ -310,6 +479,10 @@ def selftest():
     assert not d_off["derivation-from-source"] and not d_off["no-invented-resource"], \
         "self-test failed: el guardrail anterior acerto; el fixture no ejercita el defecto -> " + str(d_off)
 
+    consumption, iteration_message, budget_message = consumption_selftest()
+    assert all(consumption.values()), \
+        "self-test failed: the consumption family must be green -> %s" % consumption
+
     print("self-test OK: good plan passes every check (including figures quoted in its brief);")
     print("              bad plan fails every PLAN check, its brief invents $47.00;")
     print("              a valid report keeps contract-ok True; the legacy schema is rejected;")
@@ -322,6 +495,9 @@ def selftest():
         print("            - " + p)
     print("  deriv ON :", d_on)
     print("  deriv OFF:", d_off, " <- debe fallar; es lo que prueba que el check prueba algo")
+    print("  consumption  :", consumption, " <- both tripped on purpose")
+    print("    iterations ->", iteration_message[:110])
+    print("    budget     ->", budget_message[:110])
     return 0
 
 if __name__ == "__main__":

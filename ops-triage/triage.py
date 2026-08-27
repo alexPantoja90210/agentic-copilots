@@ -12,16 +12,31 @@ Requires: pip install anthropic  and  ANTHROPIC_API_KEY in your environment.
 """
 import json
 import os
+import sys
 from anthropic import Anthropic
 
 # Pick a current model from https://docs.claude.com/en/docs/about-claude/models
 MODEL = os.environ.get("TRIAGE_MODEL", "claude-sonnet-4-5")
+
+# The per-call output ceiling, passed to the API and to the budget alike, so the
+# cap projects against the number the request is actually bounded by.
+MAX_OUTPUT_TOKENS = 1024
 # The client is built on first use, never on import. Instantiating it at module
 # scope makes `import triage` require ANTHROPIC_API_KEY, which would drag a
 # credential into anything that merely imports this module — the free selftest
 # and the CI gate included. IA-27 fixed the same defect in copilot.py; here it
 # had not bitten yet only because evals.py imports triage inside run_live().
 # Working by accident is not the same as working by design.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from agent_budget import (  # noqa: E402  (import after the path shim, by necessity)
+    BudgetExceeded,
+    IterationCapExceeded,
+    RunBudget,
+)
+
+# The budget of the most recent run, readable by a caller that did not pass one.
+LAST_BUDGET = None
+
 _CLIENT = None
 
 
@@ -108,20 +123,37 @@ SYSTEM = (
     "(5) If there are no alerts, say so: return an empty ranked_causes and a proposed_next_step of 'No incident - continue monitoring.'"
 )
 
-def _run(messages, tools):
-    return _get_client().messages.create(model=MODEL, max_tokens=1024, system=SYSTEM, tools=tools, messages=messages)
+def _run(messages, tools, budget):
+    """
+    The single choke point every billed call passes through.
 
-def ask(question, verbose=True):
+    The cap is consulted BEFORE the request. Checking afterwards would only
+    produce a receipt, which is not a cap.
+    """
+    budget.before_call()
+    resp = _get_client().messages.create(model=MODEL, max_tokens=MAX_OUTPUT_TOKENS,
+                                         system=SYSTEM, tools=tools, messages=messages)
+    budget.record_response(resp)
+    return resp
+
+def ask(question, verbose=True, budget=None):
     """Phase 1: free-form Q&A over the signals (read-only)."""
+    global LAST_BUDGET
+    budget = budget or RunBudget(MODEL, max_output_per_call=MAX_OUTPUT_TOKENS)
+    LAST_BUDGET = budget
     messages = [{"role": "user", "content": question}]
     while True:
-        resp = _run(messages, READ_TOOLS)
+        budget.begin_iteration()
+        resp = _run(messages, READ_TOOLS, budget)
         if resp.stop_reason != "tool_use":
+            if verbose:
+                print("  [" + budget.summary() + "]")
             return "".join(b.text for b in resp.content if b.type == "text")
         messages.append({"role": "assistant", "content": resp.content})
         results = []
         for block in resp.content:
             if block.type == "tool_use":
+                budget.record_tool(block.name)
                 if verbose:
                     print("  [tool call] " + block.name)
                 results.append({"type": "tool_result", "tool_use_id": block.id,
@@ -137,19 +169,24 @@ def _severity_score(service):
     changed = {c.get("service") for c in SNAP.get("recent_changes", [])}
     return sev * 10 + (1 if service in changed else 0)
 
-def triage(write_files=True):
+def triage(write_files=True, budget=None, verbose=True):
     """Phase 2: agent reads the signals and submits a structured triage plan."""
+    global LAST_BUDGET
+    budget = budget or RunBudget(MODEL, max_output_per_call=MAX_OUTPUT_TOKENS)
+    LAST_BUDGET = budget
     tools = READ_TOOLS + [SUBMIT_TRIAGE_TOOL]
     messages = [{"role": "user", "content":
                  "Read the alerts, context and runbook with the tools, then call submit_triage "
                  "with the ranked probable causes and a proposed next step."}]
     while True:
-        resp = _run(messages, tools)
+        budget.begin_iteration()
+        resp = _run(messages, tools, budget)
         messages.append({"role": "assistant", "content": resp.content})
         submitted = None
         results = []
         for block in resp.content:
             if block.type == "tool_use":
+                budget.record_tool(block.name)
                 if block.name == "submit_triage":
                     submitted = dict(block.input)
                     results.append({"type": "tool_result", "tool_use_id": block.id, "content": "ok"})
@@ -166,6 +203,8 @@ def triage(write_files=True):
                 submitted["top_cause"] = ranked[0]
             else:
                 submitted.pop("top_cause", None)
+            if verbose:
+                print("  [" + budget.summary() + "]")
             if write_files:
                 with open("triage_plan.json", "w") as f:
                     json.dump(submitted, f, indent=2)
