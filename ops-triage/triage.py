@@ -16,7 +16,20 @@ from anthropic import Anthropic
 
 # Pick a current model from https://docs.claude.com/en/docs/about-claude/models
 MODEL = os.environ.get("TRIAGE_MODEL", "claude-sonnet-4-5")
-client = Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+# The client is built on first use, never on import. Instantiating it at module
+# scope makes `import triage` require ANTHROPIC_API_KEY, which would drag a
+# credential into anything that merely imports this module — the free selftest
+# and the CI gate included. IA-27 fixed the same defect in copilot.py; here it
+# had not bitten yet only because evals.py imports triage inside run_live().
+# Working by accident is not the same as working by design.
+_CLIENT = None
+
+
+def _get_client():
+    global _CLIENT
+    if _CLIENT is None:
+        _CLIENT = Anthropic()  # reads ANTHROPIC_API_KEY from the environment
+    return _CLIENT
 
 SNAP = {}
 SEV = {"critical": 3, "major": 2, "minor": 1}
@@ -96,7 +109,7 @@ SYSTEM = (
 )
 
 def _run(messages, tools):
-    return client.messages.create(model=MODEL, max_tokens=1024, system=SYSTEM, tools=tools, messages=messages)
+    return _get_client().messages.create(model=MODEL, max_tokens=1024, system=SYSTEM, tools=tools, messages=messages)
 
 def ask(question, verbose=True):
     """Phase 1: free-form Q&A over the signals (read-only)."""
