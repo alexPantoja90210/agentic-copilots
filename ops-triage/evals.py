@@ -249,6 +249,162 @@ def consumption_selftest():
     return scores, iteration_message, budget_message
 
 
+
+# ---------------------------------------------------------------------------
+# IA-4: the contract and the collector. Runs with NO AWS credentials, NO network
+# and NO cost -- CloudWatch is replaced by a client that returns recorded shapes.
+#
+# The instance ids below are invented. Real ones belong to an account and this
+# repository is public, which is also why the collector writes signals.live.json
+# and not signals.json.
+# ---------------------------------------------------------------------------
+CONTRACT_CHECKS = ("contract-ok",)
+COLLECTOR_CHECKS = ("collected-valid", "every-metric-accounted", "no-invented-alert")
+
+FAKE_IDS = ("i-0aaa111bbb222ccc3", "i-0ddd444eee555fff6")
+
+
+class _FakePaginator:
+    def __init__(self, instance_ids):
+        self.instance_ids = instance_ids
+
+    def paginate(self, **kwargs):
+        yield {"Metrics": [{"Dimensions": [{"Name": "InstanceId", "Value": i}]}
+                           for i in self.instance_ids]}
+
+
+class _FakeCloudWatch:
+    """
+    A recorded CloudWatch. `missing` is the interesting part: a real account has
+    metrics that exist in the catalogue and have no datapoints in the window,
+    which is exactly the case the collector must record instead of dropping.
+    """
+
+    def __init__(self, instance_ids, values, missing=(), empty_baseline=False):
+        self.instance_ids = list(instance_ids)
+        self.values = dict(values)
+        self.missing = set(missing)
+        self.empty_baseline = empty_baseline
+        self.calls = 0
+
+    def get_paginator(self, _name):
+        return _FakePaginator(self.instance_ids)
+
+    def get_metric_statistics(self, **kwargs):
+        self.calls += 1
+        if kwargs["MetricName"] in self.missing:
+            return {"Datapoints": []}
+        if self.empty_baseline and kwargs["Period"] >= 3600:
+            return {"Datapoints": []}
+        return {"Datapoints": [{"Average": self.values.get(kwargs["MetricName"], 1.0)}]}
+
+
+def _read_json(path):
+    with open(path, encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def contract_selftest():
+    """The contract, in both directions."""
+    from signals_contract import validate_signals
+
+    good = _read_json("signals.json")
+    assert not validate_signals(good), \
+        "self-test failed: the shipped signals.json must satisfy its own contract -> %s" \
+        % validate_signals(good)
+
+    # The check this contract exists for: an alert about a service nobody declared.
+    ghost = _read_json("fixtures/broken_service_ref.json")
+    problems = validate_signals(ghost)
+    assert problems, "self-test failed: an alert on an undeclared service must be RED"
+    assert any("ghost-svc" in problem for problem in problems), \
+        "self-test failed: the violation must name the offending service -> %s" % problems
+
+    # And the consumer must refuse it, not merely score it.
+    import triage
+    try:
+        triage.load_snapshot("fixtures/broken_service_ref.json")
+        raise AssertionError("self-test failed: load_snapshot accepted a snapshot "
+                             "that violates the contract")
+    except triage.SignalsContractError:
+        pass
+
+    return {"contract-ok": True}, problems[0]
+
+
+def collector_selftest():
+    """The collector, driven by recorded responses."""
+    import collector
+    from signals_contract import validate_signals
+
+    scores = {}
+
+    # ---- 1. a busy account: metrics emitted, one threshold crossed ----
+    busy = _FakeCloudWatch(FAKE_IDS,
+                           {"CPUUtilization": 93.5, "StatusCheckFailed": 0.0,
+                            "CPUCreditBalance": 120.0},
+                           missing=("EBSWriteOps",))
+    snapshot = collector.collect(client=busy, region="us-east-1")
+    problems = validate_signals(snapshot)
+    scores["collected-valid"] = not problems
+    assert not problems, \
+        "self-test failed: the collected snapshot must satisfy the contract -> %s" % problems
+
+    # The invariant borrowed from IA-38: nothing disappears quietly.
+    emitted = {(m["service"], m["name"]) for m in snapshot["metrics"]}
+    skipped = {(s["target"], s["metric"]) for s in snapshot["source"]["skipped_metrics"]}
+    considered = {(i, n) for i in FAKE_IDS
+                  for n in list(collector.THRESHOLDS) + list(collector.CONTEXT_METRICS)}
+    scores["every-metric-accounted"] = (emitted | skipped) == considered and not (emitted & skipped)
+    assert scores["every-metric-accounted"], \
+        "self-test failed: a metric was neither emitted nor recorded as skipped"
+
+    assert len(snapshot["alerts"]) == 2, \
+        "self-test failed: CPU at 93.5 over a threshold of 80 must alert on both targets"
+
+    # ---- 2. a quiet account: NO alert may be invented ----
+    quiet = _FakeCloudWatch(FAKE_IDS, {"CPUUtilization": 4.0, "StatusCheckFailed": 0.0,
+                                       "CPUCreditBalance": 200.0})
+    calm = collector.collect(client=quiet, region="us-east-1")
+    scores["no-invented-alert"] = calm["alerts"] == []
+    assert scores["no-invented-alert"], \
+        "self-test failed: no declared threshold was crossed, so alerts must be empty -> %s" \
+        % calm["alerts"]
+    assert not validate_signals(calm), "self-test failed: the quiet snapshot must still be valid"
+
+    # ---- 3. NEGATIVE: an account with targets but no usable data ----
+    # This is the defect the first live run exposed. An empty snapshot passes the
+    # contract and reads as a healthy quiet system. It must fail loudly instead.
+    barren = _FakeCloudWatch(FAKE_IDS, {}, missing=tuple(collector.THRESHOLDS) + collector.CONTEXT_METRICS)
+    try:
+        collector.collect(client=barren, region="us-east-1")
+        raise AssertionError("self-test failed: targets with no usable datapoints must "
+                             "abort, not produce an empty snapshot that looks healthy")
+    except collector.CollectorError as error:
+        barren_message = str(error)
+    assert "not one metric had usable datapoints" in barren_message
+
+    # ---- 4. NEGATIVE: no targets at all ----
+    try:
+        collector.collect(client=_FakeCloudWatch((), {}), region="us-east-1")
+        raise AssertionError("self-test failed: an account with no metrics must abort")
+    except collector.CollectorError:
+        pass
+
+    # ---- 5. the period is computed, not assumed ----
+    # A 290-hour window at 300s would ask for 3480 datapoints against a cap of
+    # 1440. The second defect the live run exposed.
+    import datetime
+    now = datetime.datetime.now(datetime.timezone.utc)
+    for hours in (3, 24, 290, 400):
+        start = now - datetime.timedelta(hours=hours)
+        period = collector.choose_period(start, now, now)
+        assert (hours * 3600) / period <= collector.MAX_DATAPOINTS, \
+            "self-test failed: a %dh window at %ds exceeds the datapoint cap" % (hours, period)
+
+    return scores, barren_message
+
+
 def selftest():
     """Validate the checks with no LLM: a perfect plan passes, a bad plan fails."""
     snap = {
@@ -283,12 +439,21 @@ def selftest():
     assert ref["top"] == "checkout-api", "ref top should be checkout-api -> " + str(ref)
     assert all(g.values()), "self-test failed: good plan should pass -> " + str(g)
     assert not any(b.values()), "self-test failed: bad plan should fail all -> " + str(b)
+    contract, ghost_problem = contract_selftest()
+    collected, barren_message = collector_selftest()
+    assert all(contract.values()) and all(collected.values()), \
+        "self-test failed: contract/collector families must be green -> %s %s" % (contract, collected)
+
     consumption, iteration_message, budget_message = consumption_selftest()
     assert all(consumption.values()), \
         "self-test failed: the consumption family must be green -> %s" % consumption
 
     print("self-test OK: good plan passes all checks; bad plan fails all checks;")
     print("              and both consumption caps were demonstrated by tripping.")
+    print("  contract     :", contract)
+    print("               ->", ghost_problem[:104])
+    print("  collector    :", collected)
+    print("    no data    ->", barren_message.splitlines()[0][:104])
     print("  consumption  :", consumption, " <- both tripped on purpose")
     print("    iterations ->", iteration_message[:110])
     print("    budget     ->", budget_message[:110])

@@ -37,6 +37,101 @@ python evals.py                # live: scores the agent against the fixtures (GR
 ```
 Model is env-configurable: `set TRIAGE_MODEL=claude-...`.
 
+## The input contract, and where the input comes from
+
+`signals.json` used to be hand-written and loaded with a bare `json.load`. That
+was survivable only while producer and consumer were the same person.
+
+IA-4 introduced a collector, and the moment something *produces* this file the
+two can drift apart. That is not hypothetical: it is IA-26 in the sibling agent,
+where the tools were reading a schema `guardian.py` had stopped producing and
+the model was fluent enough to hide the gap.
+
+So the contract came first. `signals_contract.py` enforces one rule above all:
+
+> **No alert and no metric may refer to a service that is not in `services`.**
+
+An alert about a service nobody declared is the same defect as a plan ranking a
+resource that does not exist. From inside the conversation the agent cannot tell
+the difference. `load_snapshot` now refuses such a file by name:
+
+```
+alerts[1]: refers to service 'ghost-svc', which is not in 'services'.
+An alert about a service nobody declared cannot be triaged.
+```
+
+Note what the contract does **not** check: whether the values are *right*.
+Nothing here can know that. It checks that the shape is usable and the
+references resolve.
+
+## The CloudWatch collector
+
+`collector.py` reads EC2 metrics from the live CloudWatch API, read-only, and
+writes a snapshot that satisfies the contract.
+
+```bash
+python collector.py us-east-1 290 7      # region, window hours, baseline days
+```
+
+**It writes `signals.live.json`, never `signals.json`.** The committed file is
+the hand-written worked example and stays that way; the collected one carries
+real instance ids from a real account, and this repository is public. It is
+gitignored for that reason.
+
+### What it does not collect, and says so
+
+`recent_changes` is deploy history — CloudTrail or a CI system, not CloudWatch.
+`runbook` is operational knowledge, written by people. Both are declared in
+`source.not_collected` **with the reason**, because an empty list would read as
+"nothing was deployed" when the truth is "nobody is looking". Those are very
+different things to a triage agent and identical in an empty array.
+
+### Every metric is emitted or explained
+
+The invariant is borrowed from the sibling planner because it was the right one:
+a metric with no datapoints goes into `source.skipped_metrics` with its reason.
+Never dropped. A collector that quietly discards a metric produces a snapshot
+that looks complete and is not.
+
+### Thresholds are a choice, not a truth
+
+Nothing in AWS says 80% CPU is a problem. The thresholds live in `THRESHOLDS`,
+are echoed into `source.thresholds` on every run, and exist to be argued with.
+That is the difference between a threshold and a magic number.
+
+### Two defects the first live run exposed
+
+Both were constants where functions belonged, and **neither was caught by the
+offline tests — because the test data was chosen by the same person who wrote
+the assumption.**
+
+1. **A fixed 3-hour window.** Against an account whose instances were terminated
+   eleven days earlier it collected nothing, and the empty snapshot passed the
+   contract cleanly while reading as a healthy quiet system. The collector now
+   aborts when it finds targets but no usable data.
+2. **A fixed 300-second period.** `get_metric_statistics` returns at most 1440
+   datapoints, so widening the window to reach the data would have failed the
+   call instead. The period is now computed from the window and the age of the
+   data, respecting CloudWatch's own resolution limits.
+
+The second would only have appeared *after* fixing the first. Running against
+reality found both in one afternoon.
+
+### Provenance, and why it matters here
+
+A real run against a real account produced one alert: a CPU credit balance of
+15.05 against a threshold of 30. It is correctly derived and it describes a
+machine that no longer exists. Without `source.window_start` and
+`source.collected_at`, that alert reads as an incident in progress.
+
+## The gate needs no AWS account
+
+`evals.py --selftest` drives the collector with recorded CloudWatch shapes: no
+credentials, no network, no cost. The negative cases are the point — an account
+with no data must abort, a quiet account must produce **zero** alerts rather
+than an invented one, and a snapshot referencing an undeclared service must be
+refused. Fixtures use invented instance ids.
+
 ## Honest limits
 - Read-only by design; it proposes, a human approves. That's the feature.
 - Evals run on fixtures (known answers), not live telemetry — intentional, to keep the gate deterministic.

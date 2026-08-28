@@ -9,3 +9,10 @@ __pycache__/
 # generated run outputs (kept out of source; regenerated on each run)
 triage_plan.json
 incident_brief.md
+
+# IA-4: collected observability snapshots. The hand-written signals.json IS
+# versioned as the worked example; anything the collector produces is NOT.
+# It carries real instance ids from the operator's account, and this repository
+# is public. The example teaches the schema; the live file would leak inventory.
+ops-triage/signals.live.json
+ops-triage/signals.*.live.json

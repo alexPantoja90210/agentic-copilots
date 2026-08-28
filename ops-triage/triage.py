@@ -15,6 +15,12 @@ import os
 import sys
 from anthropic import Anthropic
 
+from signals_contract import (
+    SignalsContractError,
+    describe_problems,
+    validate_signals,
+)
+
 # Pick a current model from https://docs.claude.com/en/docs/about-claude/models
 MODEL = os.environ.get("TRIAGE_MODEL", "claude-sonnet-4-5")
 
@@ -50,9 +56,21 @@ SNAP = {}
 SEV = {"critical": 3, "major": 2, "minor": 1}
 
 def load_snapshot(path="signals.json"):
+    """
+    Load the signals snapshot, refusing anything that does not meet the contract.
+
+    It fails loudly and early on purpose. The alternative — loading whatever is
+    in the file and letting the agent narrate around the gaps — is exactly what
+    IA-26 found in the sibling agent: the model was fluent enough to hide a
+    broken schema, and nothing looked wrong until someone checked by hand.
+    """
     global SNAP
-    with open(path) as f:
-        SNAP = json.load(f)
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    problems = validate_signals(data)
+    if problems:
+        raise SignalsContractError(describe_problems(path, problems))
+    SNAP = data
     return SNAP
 
 # ---------- read-only tools (none of these change anything) ----------

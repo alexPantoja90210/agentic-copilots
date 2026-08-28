@@ -1,0 +1,13 @@
+{
+  "window": "last_30m",
+  "services": ["checkout-api", "payments-db"],
+  "alerts": [
+    {"id": "AL-1", "service": "checkout-api", "signal": "error_rate",
+     "severity": "critical", "value": 0.42, "threshold": 0.05, "first_seen": "T-8m"},
+    {"id": "AL-2", "service": "ghost-svc", "signal": "latency_p95",
+     "severity": "major", "value": 900, "threshold": 400, "first_seen": "T-6m"}
+  ],
+  "metrics": [
+    {"id": "M-1", "service": "checkout-api", "name": "error_rate", "value": 0.42, "baseline": 0.01}
+  ]
+}
