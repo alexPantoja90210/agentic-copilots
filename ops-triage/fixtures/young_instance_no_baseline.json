@@ -1,0 +1,654 @@
+{
+  "captured_at": "2026-09-01T15:48:26.814228+00:00",
+  "region": "us-east-1",
+  "namespace": "AWS/EC2",
+  "statistic": "Average",
+  "window_hours": 3,
+  "baseline_days": 7,
+  "window_period_seconds": 60,
+  "baseline_period_seconds": 900,
+  "targets": [
+    "i-0aaaaaaaaaaaaaaaa",
+    "i-0bbbbbbbbbbbbbbbb"
+  ],
+  "why_this_exists": "Recorded from a live account whose instance was hours old. Values are present and every baseline window is empty. The collector discarded every metric on this input and aborted (IA-53). Instance ids are synthetic; the mapping to the real ones was never written down.",
+  "summary": {
+    "window_with_data": 7,
+    "window_empty": 7,
+    "baseline_with_data": 0,
+    "baseline_empty": 14
+  },
+  "responses": {
+    "i-0aaaaaaaaaaaaaaaa|CPUUtilization|window": {
+      "Datapoints": [
+        {
+          "Average": 0.278425,
+          "Timestamp": "2026-09-01T14:50:00+00:00"
+        },
+        {
+          "Average": 0.214994,
+          "Timestamp": "2026-09-01T15:35:00+00:00"
+        },
+        {
+          "Average": 0.907161,
+          "Timestamp": "2026-09-01T14:25:00+00:00"
+        },
+        {
+          "Average": 0.200053,
+          "Timestamp": "2026-09-01T15:45:00+00:00"
+        },
+        {
+          "Average": 0.234995,
+          "Timestamp": "2026-09-01T14:40:00+00:00"
+        },
+        {
+          "Average": 0.216692,
+          "Timestamp": "2026-09-01T15:15:00+00:00"
+        },
+        {
+          "Average": 0.206652,
+          "Timestamp": "2026-09-01T15:25:00+00:00"
+        },
+        {
+          "Average": 0.198346,
+          "Timestamp": "2026-09-01T15:30:00+00:00"
+        },
+        {
+          "Average": 0.211627,
+          "Timestamp": "2026-09-01T15:40:00+00:00"
+        },
+        {
+          "Average": 0.220003,
+          "Timestamp": "2026-09-01T14:30:00+00:00"
+        },
+        {
+          "Average": 0.248246,
+          "Timestamp": "2026-09-01T14:35:00+00:00"
+        },
+        {
+          "Average": 3.1418,
+          "Timestamp": "2026-09-01T15:10:00+00:00"
+        },
+        {
+          "Average": 0.213285,
+          "Timestamp": "2026-09-01T15:20:00+00:00"
+        },
+        {
+          "Average": 0.248331,
+          "Timestamp": "2026-09-01T14:45:00+00:00"
+        }
+      ]
+    },
+    "i-0aaaaaaaaaaaaaaaa|CPUUtilization|baseline": {
+      "Datapoints": []
+    },
+    "i-0aaaaaaaaaaaaaaaa|StatusCheckFailed|window": {
+      "Datapoints": [
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:24:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:48:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:41:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:22:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:46:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:39:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:20:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:35:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:28:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:52:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:45:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:33:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:26:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:50:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:43:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:39:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:38:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:37:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:36:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:44:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:19:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:43:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:18:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:42:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:17:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:41:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:40:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:23:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:47:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:40:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:21:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:45:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:38:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:53:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:46:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:34:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:27:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:51:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:44:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:25:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:49:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:42:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:32:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:31:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:55:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:30:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:54:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:29:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:37:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:36:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:35:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:34:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:33:00+00:00"
+        }
+      ]
+    },
+    "i-0aaaaaaaaaaaaaaaa|StatusCheckFailed|baseline": {
+      "Datapoints": []
+    },
+    "i-0aaaaaaaaaaaaaaaa|CPUCreditBalance|window": {
+      "Datapoints": [
+        {
+          "Average": 5.648455,
+          "Timestamp": "2026-09-01T15:15:00+00:00"
+        },
+        {
+          "Average": 0.478947,
+          "Timestamp": "2026-09-01T14:30:00+00:00"
+        },
+        {
+          "Average": 10.539635,
+          "Timestamp": "2026-09-01T15:40:00+00:00"
+        },
+        {
+          "Average": 8.580483,
+          "Timestamp": "2026-09-01T15:30:00+00:00"
+        },
+        {
+          "Average": 3.408758,
+          "Timestamp": "2026-09-01T14:45:00+00:00"
+        },
+        {
+          "Average": 6.622659,
+          "Timestamp": "2026-09-01T15:20:00+00:00"
+        },
+        {
+          "Average": 1.457257,
+          "Timestamp": "2026-09-01T14:35:00+00:00"
+        },
+        {
+          "Average": 11.519086,
+          "Timestamp": "2026-09-01T15:45:00+00:00"
+        },
+        {
+          "Average": 9.560897,
+          "Timestamp": "2026-09-01T15:35:00+00:00"
+        },
+        {
+          "Average": 4.383371,
+          "Timestamp": "2026-09-01T14:50:00+00:00"
+        },
+        {
+          "Average": 7.603216,
+          "Timestamp": "2026-09-01T15:25:00+00:00"
+        },
+        {
+          "Average": 2.431948,
+          "Timestamp": "2026-09-01T14:40:00+00:00"
+        }
+      ]
+    },
+    "i-0aaaaaaaaaaaaaaaa|CPUCreditBalance|baseline": {
+      "Datapoints": []
+    },
+    "i-0aaaaaaaaaaaaaaaa|NetworkIn|window": {
+      "Datapoints": [
+        {
+          "Average": 4856.2,
+          "Timestamp": "2026-09-01T15:40:00+00:00"
+        },
+        {
+          "Average": 2079.8,
+          "Timestamp": "2026-09-01T14:30:00+00:00"
+        },
+        {
+          "Average": 2093.0,
+          "Timestamp": "2026-09-01T14:40:00+00:00"
+        },
+        {
+          "Average": 2124.2,
+          "Timestamp": "2026-09-01T15:15:00+00:00"
+        },
+        {
+          "Average": 2060.6,
+          "Timestamp": "2026-09-01T14:50:00+00:00"
+        },
+        {
+          "Average": 2178.2,
+          "Timestamp": "2026-09-01T15:25:00+00:00"
+        },
+        {
+          "Average": 17147.0,
+          "Timestamp": "2026-09-01T14:25:00+00:00"
+        },
+        {
+          "Average": 2011.4,
+          "Timestamp": "2026-09-01T15:35:00+00:00"
+        },
+        {
+          "Average": 3650.0,
+          "Timestamp": "2026-09-01T14:35:00+00:00"
+        },
+        {
+          "Average": 18059.0,
+          "Timestamp": "2026-09-01T15:10:00+00:00"
+        },
+        {
+          "Average": 2194.0,
+          "Timestamp": "2026-09-01T15:45:00+00:00"
+        },
+        {
+          "Average": 3636.8,
+          "Timestamp": "2026-09-01T15:20:00+00:00"
+        },
+        {
+          "Average": 3438.8,
+          "Timestamp": "2026-09-01T15:30:00+00:00"
+        },
+        {
+          "Average": 3474.8,
+          "Timestamp": "2026-09-01T14:45:00+00:00"
+        }
+      ]
+    },
+    "i-0aaaaaaaaaaaaaaaa|NetworkIn|baseline": {
+      "Datapoints": []
+    },
+    "i-0aaaaaaaaaaaaaaaa|NetworkOut|window": {
+      "Datapoints": [
+        {
+          "Average": 3493.0,
+          "Timestamp": "2026-09-01T15:40:00+00:00"
+        },
+        {
+          "Average": 1743.2,
+          "Timestamp": "2026-09-01T14:30:00+00:00"
+        },
+        {
+          "Average": 1756.4,
+          "Timestamp": "2026-09-01T14:40:00+00:00"
+        },
+        {
+          "Average": 1800.8,
+          "Timestamp": "2026-09-01T15:15:00+00:00"
+        },
+        {
+          "Average": 1756.4,
+          "Timestamp": "2026-09-01T14:50:00+00:00"
+        },
+        {
+          "Average": 1841.6,
+          "Timestamp": "2026-09-01T15:25:00+00:00"
+        },
+        {
+          "Average": 15014.0,
+          "Timestamp": "2026-09-01T14:25:00+00:00"
+        },
+        {
+          "Average": 1674.8,
+          "Timestamp": "2026-09-01T15:35:00+00:00"
+        },
+        {
+          "Average": 2837.4,
+          "Timestamp": "2026-09-01T14:35:00+00:00"
+        },
+        {
+          "Average": 16788.0,
+          "Timestamp": "2026-09-01T15:10:00+00:00"
+        },
+        {
+          "Average": 1772.25,
+          "Timestamp": "2026-09-01T15:45:00+00:00"
+        },
+        {
+          "Average": 2811.0,
+          "Timestamp": "2026-09-01T15:20:00+00:00"
+        },
+        {
+          "Average": 2599.8,
+          "Timestamp": "2026-09-01T15:30:00+00:00"
+        },
+        {
+          "Average": 2622.6,
+          "Timestamp": "2026-09-01T14:45:00+00:00"
+        }
+      ]
+    },
+    "i-0aaaaaaaaaaaaaaaa|NetworkOut|baseline": {
+      "Datapoints": []
+    },
+    "i-0aaaaaaaaaaaaaaaa|EBSReadOps|window": {
+      "Datapoints": [
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:15:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:30:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:40:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:30:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:45:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:20:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:35:00+00:00"
+        },
+        {
+          "Average": 2012.333333,
+          "Timestamp": "2026-09-01T15:10:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:45:00+00:00"
+        },
+        {
+          "Average": 2022.333333,
+          "Timestamp": "2026-09-01T14:25:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:35:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:50:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T15:25:00+00:00"
+        },
+        {
+          "Average": 0.0,
+          "Timestamp": "2026-09-01T14:40:00+00:00"
+        }
+      ]
+    },
+    "i-0aaaaaaaaaaaaaaaa|EBSReadOps|baseline": {
+      "Datapoints": []
+    },
+    "i-0aaaaaaaaaaaaaaaa|EBSWriteOps|window": {
+      "Datapoints": [
+        {
+          "Average": 66.0,
+          "Timestamp": "2026-09-01T15:15:00+00:00"
+        },
+        {
+          "Average": 37.6,
+          "Timestamp": "2026-09-01T14:30:00+00:00"
+        },
+        {
+          "Average": 59.6,
+          "Timestamp": "2026-09-01T15:40:00+00:00"
+        },
+        {
+          "Average": 66.6,
+          "Timestamp": "2026-09-01T15:30:00+00:00"
+        },
+        {
+          "Average": 32.2,
+          "Timestamp": "2026-09-01T14:45:00+00:00"
+        },
+        {
+          "Average": 61.8,
+          "Timestamp": "2026-09-01T15:20:00+00:00"
+        },
+        {
+          "Average": 32.4,
+          "Timestamp": "2026-09-01T14:35:00+00:00"
+        },
+        {
+          "Average": 161.333333,
+          "Timestamp": "2026-09-01T15:10:00+00:00"
+        },
+        {
+          "Average": 69.0,
+          "Timestamp": "2026-09-01T15:45:00+00:00"
+        },
+        {
+          "Average": 237.666667,
+          "Timestamp": "2026-09-01T14:25:00+00:00"
+        },
+        {
+          "Average": 72.0,
+          "Timestamp": "2026-09-01T15:35:00+00:00"
+        },
+        {
+          "Average": 40.2,
+          "Timestamp": "2026-09-01T14:50:00+00:00"
+        },
+        {
+          "Average": 72.0,
+          "Timestamp": "2026-09-01T15:25:00+00:00"
+        },
+        {
+          "Average": 42.2,
+          "Timestamp": "2026-09-01T14:40:00+00:00"
+        }
+      ]
+    },
+    "i-0aaaaaaaaaaaaaaaa|EBSWriteOps|baseline": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|CPUUtilization|window": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|CPUUtilization|baseline": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|StatusCheckFailed|window": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|StatusCheckFailed|baseline": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|CPUCreditBalance|window": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|CPUCreditBalance|baseline": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|NetworkIn|window": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|NetworkIn|baseline": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|NetworkOut|window": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|NetworkOut|baseline": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|EBSReadOps|window": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|EBSReadOps|baseline": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|EBSWriteOps|window": {
+      "Datapoints": []
+    },
+    "i-0bbbbbbbbbbbbbbbb|EBSWriteOps|baseline": {
+      "Datapoints": []
+    }
+  }
+}
