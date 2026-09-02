@@ -124,6 +124,47 @@ def assert_standard_credits(ec2, instance_id: str) -> str:
     return mode
 
 
+RESTORE_ATTEMPTS = 3
+RESTORE_BACKOFF_S = (15, 45, 90)
+
+
+def current_state(ec2, instance_id: str) -> str:
+    got = ec2.describe_instances(InstanceIds=[instance_id])
+    return got["Reservations"][0]["Instances"][0]["State"]["Name"]
+
+
+def start_with_retries(ec2, instance_id: str, attempts: int = RESTORE_ATTEMPTS,
+                       sleeper=time.sleep, timeout_s: int = 300):
+    """
+    Start the instance, and mean it.
+
+    On 1 Sep 2026 the first real F3 left the pilot target stopped: AWS answered
+    the start with `Server.InternalError`, the harness tried exactly once, gave
+    up, and recorded the failure in a JSON file nobody was watching. A manual
+    retry minutes later succeeded on the first attempt, which is the ordinary
+    behaviour of that error — it is transient and usually lands on different
+    hardware next time.
+
+    One attempt is not a serious effort to recover from a transient failure.
+
+    Returns (running, attempts_made, restored_at, errors).
+    """
+    errors = []
+    for attempt in range(1, attempts + 1):
+        try:
+            ec2.start_instances(InstanceIds=[instance_id])
+            wait_for_state(ec2, instance_id, "running", timeout_s=timeout_s)
+            return True, attempt, datetime.now(timezone.utc), errors
+        except Exception as exc:  # noqa: BLE001 - every failure is data
+            errors.append("attempt %d: %s: %s" % (attempt, type(exc).__name__, exc))
+            print("  restore attempt %d failed: %s" % (attempt, exc), file=sys.stderr)
+            if attempt < attempts:
+                pause = RESTORE_BACKOFF_S[min(attempt - 1, len(RESTORE_BACKOFF_S) - 1)]
+                print("  retrying in %ds" % pause, file=sys.stderr)
+                sleeper(pause)
+    return False, attempts, None, errors
+
+
 def wait_for_state(ec2, instance_id: str, state: str, timeout_s: int = 300) -> None:
     deadline = time.time() + timeout_s
     while time.time() < deadline:
@@ -208,7 +249,23 @@ def main(argv=None) -> int:
     if args.fault in ("F1", "F2"):
         mode = assert_standard_credits(ec2, instance_id)
         print(f"credit mode: {mode}")
-        ensure_running(ec2, instance_id, args.dry_run)
+
+    # IA-52, criterion 5. A previous run whose restore failed leaves the target
+    # stopped. Opening a window against a stopped instance would produce a
+    # labelled incident whose signal is the LAST failure, not this one -- a
+    # contaminated data point that looks exactly like a clean one.
+    #
+    # So the state is confirmed, not assumed, before any label is written.
+    ensure_running(ec2, instance_id, args.dry_run)
+    if not args.dry_run:
+        state = current_state(ec2, instance_id)
+        if state != "running":
+            raise InjectionError(
+                f"{instance_id} is '{state}', not running, and could not be started. "
+                "Refusing to open a window: the incident would carry the previous "
+                "failure's signal under this run's label. Start it by hand, confirm "
+                "it is running, and try again."
+            )
 
     window_start = datetime.now(timezone.utc)
     window_end_planned = window_start + timedelta(seconds=seconds)
@@ -250,22 +307,42 @@ def main(argv=None) -> int:
     finally:
         # Restore, always. A harness that leaves an instance stopped spends
         # money for nothing and corrupts the next window.
+        details = {}
         if args.fault == "F3" and not args.dry_run:
-            try:
-                print("  restoring: starting the instance again")
-                ec2.start_instances(InstanceIds=[instance_id])
-                wait_for_state(ec2, instance_id, "running")
-            except Exception as exc:  # noqa: BLE001
+            print("  restoring: starting the instance again")
+            restored, tries, restored_at, errors = start_with_retries(ec2, instance_id)
+            details["restore_attempts"] = tries
+            details["service_restored_at"] = restored_at.isoformat() if restored_at else None
+            if not restored:
                 outcome = "failed"
-                notes = (notes + " | " if notes else "") + f"restore failed: {exc}"
+                notes = (notes + " | " if notes else "") + "restore failed: " + "; ".join(errors)
+
+        if not args.dry_run:
+            try:
+                details["instance_state_left"] = current_state(ec2, instance_id)
+            except Exception as exc:  # noqa: BLE001
+                details["instance_state_left"] = "unknown: %s" % exc
+
         gt.close_incident(
             incident_id=incident_id,
             window_end_actual=datetime.now(timezone.utc),
             outcome=outcome,
             notes=notes,
             path=log_path,
+            details=details,
         )
         print(f"closed: {incident_id} -> {outcome}")
+
+        # A failure that leaves infrastructure broken deserves more than a line
+        # inside a JSON file nobody is watching.
+        if details.get("instance_state_left") not in (None, "running"):
+            print("", file=sys.stderr)
+            print("!! THE PILOT TARGET WAS LEFT %s" % str(details["instance_state_left"]).upper(),
+                  file=sys.stderr)
+            print("!! %s is not running. The next injection will refuse to open a"
+                  % instance_id, file=sys.stderr)
+            print("!! window until it is. Start it by hand and confirm the state.",
+                  file=sys.stderr)
 
     return 0 if outcome == "completed" else 1
 

@@ -165,8 +165,16 @@ def close_incident(
     outcome: str,
     notes: str = "",
     path: Path = DEFAULT_LOG,
+    details: dict | None = None,
 ) -> dict:
-    """Close by APPENDING. The open record is never rewritten."""
+    """
+    Close by APPENDING. The open record is never rewritten.
+
+    `details` carries structured facts about how the run ended — the state the
+    instance was left in, whether service came back and when. IA-52: those were
+    buried in a prose note, where nothing can query them and a reader has to
+    parse a sentence to learn that infrastructure was left broken.
+    """
     existing = read_all(path)
     if not any(e.get("record") == "open" and e.get("incident_id") == incident_id for e in existing):
         raise GroundTruthError(f"No open record for incident {incident_id}.")
@@ -176,9 +184,17 @@ def close_incident(
     record = {
         "record": "close",
         "incident_id": incident_id,
+        # When the HARNESS stopped acting. Not necessarily when service
+        # returned: those coincide only if the restore succeeded, and on
+        # 1 Sep 2026 they did not. `service_restored_at` in details says which.
         "window_end_actual": _utc(window_end_actual),
         "outcome": outcome,
         "notes": notes,
         "written_at": _utc(),
     }
+    for key, value in (details or {}).items():
+        if key in record:
+            raise GroundTruthError(
+                "details may not overwrite the field %r of a close record" % key)
+        record[key] = value
     return _append(record, path)
