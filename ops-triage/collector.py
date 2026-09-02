@@ -40,8 +40,38 @@ OUTPUT_DEFAULT = "signals.live.json"
 THRESHOLDS = {
     "CPUUtilization": ("gt", 80.0, "major", "cpu_utilization"),
     "StatusCheckFailed": ("gt", 0.0, "critical", "status_check"),
-    "CPUCreditBalance": ("lt", 30.0, "major", "cpu_credit_balance"),
 }
+
+# IA-51. CPUCreditBalance used to live in THRESHOLDS as ("lt", 30.0, ...), and
+# that rule could not tell two opposite situations apart:
+#
+#   exhausted    - a long-running instance that has burned its balance and is
+#                  now throttled. Worth waking someone for.
+#   not accrued  - an instance too young to have earned credits yet. Nothing is
+#                  wrong; time is the only fix.
+#
+# Both sit below 30, so a brand-new healthy t3.micro was reported MAJOR for the
+# first two and a half hours of its life. That is the alert that teaches an
+# on-call engineer to ignore alerts.
+#
+# What separates them is direction, not level: a balance that is FALLING is
+# depletion; one that is RISING is accrual. Direction needs the series, which is
+# why this metric is judged by `credit_verdict` below instead of by a constant.
+#
+# The two numbers here are judgement calls, stated so they can be argued with:
+#
+#   TREND_TOLERANCE  a t3.micro earns 12 credits/hour. Losing less than 1/hour
+#                    is noise or near-equilibrium, not depletion.
+#   EXHAUSTED_FLOOR  at or below 1 credit there is nothing left to spend. This
+#                    catches the case the trend alone misses: an instance
+#                    already pinned at zero is FLAT, not falling, and would
+#                    otherwise stay silent while throttled.
+#   MIN_TREND_POINTS two points can be a blip. Below this the collector says it
+#                    cannot judge, rather than guessing.
+TREND_METRICS = ("CPUCreditBalance",)
+TREND_TOLERANCE = 1.0
+EXHAUSTED_FLOOR = 1.0
+MIN_TREND_POINTS = 3
 
 # Metrics collected for context even when no threshold applies to them.
 CONTEXT_METRICS = ("NetworkIn", "NetworkOut", "EBSReadOps", "EBSWriteOps")
@@ -112,7 +142,14 @@ def discover_targets(client, namespace="AWS/EC2", probe="CPUUtilization"):
     return sorted(set(targets))
 
 
-def _query(client, namespace, metric_name, instance_id, start, end, period):
+def _query_points(client, namespace, metric_name, instance_id, start, end, period):
+    """
+    The datapoints, oldest first. One call, one code path to CloudWatch.
+
+    `_query` used to average inside the request function, which meant the series
+    was thrown away before anyone could look at it. IA-51 needs the direction of
+    travel, and direction is a property of the series, not of its mean.
+    """
     response = client.get_metric_statistics(
         Namespace=namespace,
         MetricName=metric_name,
@@ -123,9 +160,59 @@ def _query(client, namespace, metric_name, instance_id, start, end, period):
         Statistics=[STATISTIC],
     )
     points = response.get("Datapoints", [])
+    return sorted(points, key=lambda point: point["Timestamp"])
+
+
+def _query(client, namespace, metric_name, instance_id, start, end, period):
+    points = _query_points(client, namespace, metric_name, instance_id,
+                           start, end, period)
     if not points:
         return None
     return sum(point[STATISTIC] for point in points) / len(points)
+
+
+def credit_verdict(points, tolerance=None, floor=None, min_points=None):
+    """
+    Judge a CPUCreditBalance series by where it is GOING, not only where it is.
+
+    Returns (fires, slope_per_hour, reason). `slope_per_hour` is None when the
+    series is too short to have a direction, and the reason says so instead of
+    the collector inventing one.
+    """
+    tolerance = TREND_TOLERANCE if tolerance is None else tolerance
+    floor = EXHAUSTED_FLOOR if floor is None else floor
+    min_points = MIN_TREND_POINTS if min_points is None else min_points
+
+    if len(points) < min_points:
+        return False, None, (
+            "only %d datapoint(s) in the window; at least %d are needed to tell "
+            "a falling balance from a rising one, so no verdict is claimed"
+            % (len(points), min_points))
+
+    first, last = points[0], points[-1]
+    hours = (last["Timestamp"] - first["Timestamp"]).total_seconds() / 3600.0
+    if hours <= 0:
+        return False, None, "the datapoints carry no elapsed time; no direction can be derived"
+
+    slope = (last[STATISTIC] - first[STATISTIC]) / hours
+
+    # Already spent. Flat at zero is not falling, so the trend alone would miss it.
+    if last[STATISTIC] <= floor and slope <= 0:
+        return True, slope, (
+            "balance is %.2f, at or below the exhausted floor of %.2f, and not recovering"
+            % (last[STATISTIC], floor))
+
+    if slope < -tolerance:
+        return True, slope, (
+            "balance is falling at %.2f credits/hour, faster than the tolerance of %.2f"
+            % (slope, tolerance))
+
+    if slope > 0:
+        return False, slope, (
+            "balance is rising at %.2f credits/hour: the instance is accruing, not depleting"
+            % slope)
+
+    return False, slope, "balance is stable at %.2f credits/hour" % slope
 
 
 def collect(region=REGION_DEFAULT, window_hours=3, baseline_days=7,
@@ -151,13 +238,20 @@ def collect(region=REGION_DEFAULT, window_hours=3, baseline_days=7,
 
     services = list(targets)
     metrics, alerts, skipped = [], [], []
-    metric_names = list(THRESHOLDS) + list(CONTEXT_METRICS)
+    # Two states that are NOT "skipped". A metric here was emitted; what is
+    # missing is context or a verdict, not the measurement. Folding these into
+    # skipped_metrics would break the invariant that a metric is either emitted
+    # or explained and never both -- and would quietly turn "we have this value"
+    # into "we do not have this metric".
+    no_baseline, not_judged = [], []
+    metric_names = list(THRESHOLDS) + list(TREND_METRICS) + list(CONTEXT_METRICS)
 
     for instance_id in targets:
         for metric_name in metric_names:
-            value = _query(client, namespace, metric_name, instance_id,
-                           window_start, now,
-                           choose_period(window_start, now, now))
+            points = _query_points(client, namespace, metric_name, instance_id,
+                                   window_start, now,
+                                   choose_period(window_start, now, now))
+            value = (sum(p[STATISTIC] for p in points) / len(points)) if points else None
             if value is None:
                 skipped.append({"metric": metric_name, "target": instance_id,
                                 "reason": "no datapoints in the collection window"})
@@ -166,11 +260,25 @@ def collect(region=REGION_DEFAULT, window_hours=3, baseline_days=7,
             baseline = _query(client, namespace, metric_name, instance_id,
                               baseline_start, window_start,
                               choose_period(baseline_start, window_start, now))
+
+            # IA-53. A missing baseline used to discard the metric entirely.
+            # That is the wrong trade: no threshold rule reads the baseline --
+            # `fired` compares value against threshold and nothing else -- so a
+            # measured value was being thrown away to protect a comparison that
+            # never happens. On an instance younger than the baseline window
+            # EVERY metric hit this branch, the metrics list came out empty, and
+            # the IA-4 abort fired: the collector reported that it had found
+            # nothing, on an account that was emitting normally. A real injected
+            # outage sat in CloudWatch, visible, and unread.
+            #
+            # Now the value is kept and the absence is stated, not implied.
+            # `baseline: None` reaches the contract as an explicit null, which
+            # it accepts only in this field and only when written on purpose.
             if baseline is None:
-                skipped.append({"metric": metric_name, "target": instance_id,
-                                "reason": "no datapoints in the baseline window, "
-                                          "so no comparison is possible"})
-                continue
+                no_baseline.append({"metric": metric_name, "target": instance_id,
+                                    "reason": "no datapoints in the baseline window, "
+                                              "so the metric is emitted without a "
+                                              "baseline and no comparison is claimed"})
 
             metric_id = "M-%s-%s" % (instance_id[-6:], metric_name)
             metrics.append({
@@ -178,8 +286,33 @@ def collect(region=REGION_DEFAULT, window_hours=3, baseline_days=7,
                 "service": instance_id,
                 "name": metric_name,
                 "value": round(value, 4),
-                "baseline": round(baseline, 4),
+                "baseline": None if baseline is None else round(baseline, 4),
             })
+
+            # IA-51. Two kinds of rule now, because two kinds of question.
+            # A level rule asks "is this value bad?". A trend rule asks "is this
+            # going the wrong way?" — the only question that separates an
+            # exhausted balance from one that has simply not accrued yet.
+            if metric_name in TREND_METRICS:
+                fires, slope, reason = credit_verdict(points)
+                if slope is None:
+                    not_judged.append({"metric": metric_name, "target": instance_id,
+                                       "reason": reason})
+                if fires:
+                    alerts.append({
+                        "id": "AL-%s-%s" % (instance_id[-6:], metric_name),
+                        "service": instance_id,
+                        "signal": "cpu_credit_balance",
+                        "severity": "major",
+                        # The alert reports the RATE, because the rate is what
+                        # was judged. Reporting the level here would invite the
+                        # reader to re-derive the old, wrong comparison.
+                        "value": round(slope, 4),
+                        "threshold": round(-TREND_TOLERANCE, 4),
+                        "first_seen": window_start.isoformat(),
+                        "reason": reason,
+                    })
+                continue
 
             rule = THRESHOLDS.get(metric_name)
             if rule is None:
@@ -198,6 +331,8 @@ def collect(region=REGION_DEFAULT, window_hours=3, baseline_days=7,
                 })
 
     # Targets but no data is the same lie as no targets, wearing a valid shape.
+    # Since IA-53 this fires only when no metric had a VALUE, which is the real
+    # emptiness. A missing baseline no longer silences a metric.
     # A snapshot whose metrics list is empty reads as "the system is quiet"; what
     # actually happened is that nobody looked where the data lives. Running this
     # against an account whose instances were terminated days ago is exactly how
@@ -233,7 +368,17 @@ def collect(region=REGION_DEFAULT, window_hours=3, baseline_days=7,
             "thresholds": {name: {"comparison": rule[0], "threshold": rule[1],
                                   "severity": rule[2]}
                            for name, rule in THRESHOLDS.items()},
+            # Published for the same reason as the thresholds: a rule the reader
+            # cannot see is a magic number, whether it is a level or a slope.
+            "trend_rules": {name: {"judged_by": "direction over the window",
+                                   "tolerance_per_hour": TREND_TOLERANCE,
+                                   "exhausted_floor": EXHAUSTED_FLOOR,
+                                   "min_points": MIN_TREND_POINTS,
+                                   "severity": "major"}
+                            for name in TREND_METRICS},
             "skipped_metrics": skipped,
+            "metrics_without_baseline": no_baseline,
+            "metrics_not_judged": not_judged,
             "not_collected": {
                 "recent_changes": "deploy history is not in CloudWatch. It comes "
                                   "from CloudTrail or a CI system, and neither is "

@@ -133,7 +133,21 @@ def validate_signals(snapshot):
             if not isinstance(metric, dict):
                 continue
             for field in ("value", "baseline"):
-                if field in metric and not _is_number(metric[field]):
+                if field not in metric:
+                    continue  # absence is already reported by _check_items
+                # IA-53. An explicit null baseline is a CLAIM, not a gap: it
+                # says the collector looked for history and there was none.
+                # A young instance has no seven days behind it, and discarding
+                # its perfectly good value to protect a comparison that no
+                # threshold rule performs is how a real outage went unseen.
+                #
+                # Only baseline may be null, and only explicitly. A MISSING
+                # baseline key stays an error, because "we looked and found
+                # nothing" and "nobody filled this in" are different claims and
+                # the reader cannot tell them apart once they look the same.
+                if field == "baseline" and metric[field] is None:
+                    continue
+                if not _is_number(metric[field]):
                     problems.append("metrics[%d]: '%s' must be a number, got %r"
                                     % (index, field, metric[field]))
 

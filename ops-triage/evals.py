@@ -11,6 +11,7 @@ Usage:
   python evals.py            # run evals against the live agent (needs ANTHROPIC_API_KEY)
   python evals.py --selftest # validate the checks with no LLM/API calls
 """
+import datetime
 import glob
 import json
 import sys
@@ -296,7 +297,56 @@ class _FakeCloudWatch:
             return {"Datapoints": []}
         if self.empty_baseline and kwargs["Period"] >= 3600:
             return {"Datapoints": []}
-        return {"Datapoints": [{"Average": self.values.get(kwargs["MetricName"], 1.0)}]}
+        # Real datapoints always carry a Timestamp, and IA-51 made the collector
+        # read it. A fake that omits a field the API always sends is a lie the
+        # tests would have to work around, so it sends one too: a flat series,
+        # which is the honest reading of "this account sat at one value".
+        value = self.values.get(kwargs["MetricName"], 1.0)
+        base = datetime.datetime(2026, 9, 1, tzinfo=datetime.timezone.utc)
+        return {"Datapoints": [
+            {"Average": value, "Timestamp": base + datetime.timedelta(minutes=5 * i)}
+            for i in range(4)
+        ]}
+
+
+class _ReplayCloudWatch:
+    """
+    CloudWatch as this account actually answered, replayed from a capture.
+
+    `_FakeCloudWatch` returns whatever the test author decided the account would
+    say, which is why it never caught IA-51 or IA-53: the fixtures encoded the
+    same assumptions as the code they were testing. This one replays responses
+    recorded from the live account by `capture_fixture.py`, so the test's idea
+    of reality comes from reality.
+
+    Window and baseline calls are told apart by the SPAN they ask for -- hours
+    against days -- rather than by the period, which is derived and could drift.
+    """
+
+    def __init__(self, path):
+        self.data = _read_json(path)
+        self.targets = list(self.data["targets"])
+        self.window_seconds = self.data["window_hours"] * 3600
+        self.responses = self.data["responses"]
+        self.calls = 0
+
+    def get_paginator(self, _name):
+        return _FakePaginator(self.targets)
+
+    def get_metric_statistics(self, **kwargs):
+        self.calls += 1
+        span = (kwargs["EndTime"] - kwargs["StartTime"]).total_seconds()
+        kind = "window" if span <= self.window_seconds * 1.5 else "baseline"
+        instance = kwargs["Dimensions"][0]["Value"]
+        key = "%s|%s|%s" % (instance, kwargs["MetricName"], kind)
+        recorded = self.responses.get(key, {"Datapoints": []})
+        # Timestamps were serialised as ISO strings when captured; the collector
+        # does arithmetic on them, so they go back as datetimes here.
+        return {"Datapoints": [
+            {"Average": point["Average"],
+             "Timestamp": datetime.datetime.fromisoformat(point["Timestamp"])}
+            for point in recorded["Datapoints"]
+        ]}
 
 
 def _read_json(path):
@@ -354,7 +404,8 @@ def collector_selftest():
     emitted = {(m["service"], m["name"]) for m in snapshot["metrics"]}
     skipped = {(s["target"], s["metric"]) for s in snapshot["source"]["skipped_metrics"]}
     considered = {(i, n) for i in FAKE_IDS
-                  for n in list(collector.THRESHOLDS) + list(collector.CONTEXT_METRICS)}
+                  for n in (list(collector.THRESHOLDS) + list(collector.TREND_METRICS)
+                            + list(collector.CONTEXT_METRICS))}
     scores["every-metric-accounted"] = (emitted | skipped) == considered and not (emitted & skipped)
     assert scores["every-metric-accounted"], \
         "self-test failed: a metric was neither emitted nor recorded as skipped"
@@ -375,7 +426,10 @@ def collector_selftest():
     # ---- 3. NEGATIVE: an account with targets but no usable data ----
     # This is the defect the first live run exposed. An empty snapshot passes the
     # contract and reads as a healthy quiet system. It must fail loudly instead.
-    barren = _FakeCloudWatch(FAKE_IDS, {}, missing=tuple(collector.THRESHOLDS) + collector.CONTEXT_METRICS)
+    barren = _FakeCloudWatch(FAKE_IDS, {},
+                             missing=(tuple(collector.THRESHOLDS)
+                                      + tuple(collector.TREND_METRICS)
+                                      + collector.CONTEXT_METRICS))
     try:
         collector.collect(client=barren, region="us-east-1")
         raise AssertionError("self-test failed: targets with no usable datapoints must "
@@ -401,6 +455,127 @@ def collector_selftest():
         period = collector.choose_period(start, now, now)
         assert (hours * 3600) / period <= collector.MAX_DATAPOINTS, \
             "self-test failed: a %dh window at %ds exceeds the datapoint cap" % (hours, period)
+
+    # ---- 6. IA-53: a young instance, replayed from the real account ----
+    # Recorded 1 Sep 2026 from an instance a few hours old: values present,
+    # every baseline window empty. Before the fix this input produced the
+    # abort in check 3 -- the collector reporting that it had found nothing on
+    # an account that was emitting normally, with an injected outage sitting
+    # unread in the data.
+    young = _ReplayCloudWatch("fixtures/young_instance_no_baseline.json")
+    snap = collector.collect(client=young, region="us-east-1")
+
+    problems = validate_signals(snap)
+    scores["young-instance-valid"] = not problems
+    assert not problems, \
+        "self-test failed: a snapshot with null baselines must satisfy the contract -> %s" % problems
+
+    assert snap["metrics"], \
+        "self-test failed: the young-instance fixture must produce metrics, not an abort"
+
+    without_baseline = [m for m in snap["metrics"] if m["baseline"] is None]
+    scores["baseline-absence-is-stated"] = len(without_baseline) == len(snap["metrics"])
+    assert scores["baseline-absence-is-stated"], \
+        "self-test failed: every metric in this fixture lacks history, so every " \
+        "baseline must be an explicit null -> %s" % [m["baseline"] for m in snap["metrics"]]
+
+    # Nothing disappears quietly: the absence is recorded, not merely implied.
+    reasons = {e["reason"] for e in snap["source"]["metrics_without_baseline"]}
+    assert any("without a baseline" in reason for reason in reasons), \
+        "self-test failed: a missing baseline must be recorded"
+
+    # The IA-38 invariant, extended. "Emitted with no baseline" and "emitted but
+    # not judged" are states OF AN EMITTED METRIC. Recording them as skipped
+    # would say the metric was never collected, which is false, and would break
+    # the exclusivity the invariant rests on.
+    emitted_here = {(m["service"], m["name"]) for m in snap["metrics"]}
+    skipped_here = {(e["target"], e["metric"]) for e in snap["source"]["skipped_metrics"]}
+    for field in ("metrics_without_baseline", "metrics_not_judged"):
+        annotated = {(e["target"], e["metric"]) for e in snap["source"][field]}
+        assert annotated <= emitted_here, \
+            "self-test failed: %s must only describe metrics that were emitted" % field
+        assert not (annotated & skipped_here), \
+            "self-test failed: a metric cannot be both skipped and %s" % field
+
+    # The value is still judged -- and IA-51 changed the verdict.
+    #
+    # This assertion used to demand the OPPOSITE. Under the old rule the young
+    # instance's balance of 5.6 was below the constant 30, so a healthy machine
+    # that had simply not accrued yet was reported MAJOR. The check was written
+    # to be flipped by this fix rather than to be quietly stepped over, and this
+    # is the flip.
+    credit_alerts = [a for a in snap["alerts"] if a["signal"] == "cpu_credit_balance"]
+    scores["young-instance-not-alerted"] = not credit_alerts
+    assert not credit_alerts, \
+        "self-test failed: an instance whose credit balance is RISING is accruing, " \
+        "not depleting, and must not alert -> %s" % credit_alerts
+
+    # ---- 8. NEGATIVE: a balance that really is draining must alert ----
+    # Built by reversing the recorded series in time. The values, the spacing
+    # and the magnitudes are the account's own; only the direction changes. That
+    # matters: an invented depletion curve would be a curve I chose, and the
+    # last three defects all came from fixtures their author had chosen.
+    #
+    # Stated plainly: this account has never actually depleted its credits, so
+    # the falling case is derived from real data rather than observed. That is a
+    # weaker claim than the rising case and the write-up says so.
+    draining = _ReplayCloudWatch("fixtures/young_instance_no_baseline.json")
+    for key, recorded in list(draining.responses.items()):
+        if "CPUCreditBalance" in key and recorded["Datapoints"]:
+            values = [p["Average"] for p in recorded["Datapoints"]]
+            stamps = [p["Timestamp"] for p in recorded["Datapoints"]]
+            recorded["Datapoints"] = [
+                {"Average": v, "Timestamp": t}
+                for v, t in zip(reversed(values), stamps)
+            ]
+    drained = collector.collect(client=draining, region="us-east-1")
+    falling = [a for a in drained["alerts"] if a["signal"] == "cpu_credit_balance"]
+    scores["draining-balance-alerts"] = bool(falling)
+    assert falling, \
+        "self-test failed: a falling credit balance must alert. If this passes " \
+        "while check 6 also passes, the rule is judging direction, which is the " \
+        "whole point of IA-51."
+    assert falling[0]["value"] < 0, \
+        "self-test failed: a depletion alert must report a NEGATIVE rate, since " \
+        "the rate is what was judged -> %s" % falling[0]
+
+    # ---- 9. NEGATIVE: exhausted and flat must not hide behind the trend ----
+    # A balance pinned at zero is not falling. Under a trend-only rule it would
+    # stay silent while the instance is throttled.
+    import datetime as _dt
+    flat_zero = [{"Average": 0.0,
+                  "Timestamp": _dt.datetime(2026, 9, 1, tzinfo=_dt.timezone.utc)
+                               + _dt.timedelta(minutes=5 * i)}
+                 for i in range(6)]
+    fires, slope, reason = collector.credit_verdict(flat_zero)
+    scores["exhausted-flat-alerts"] = fires
+    assert fires and "floor" in reason, \
+        "self-test failed: a balance flat at zero is exhausted and must alert -> %s" % reason
+
+    # ---- 10. too short to judge: say so, do not guess ----
+    two_points = flat_zero[:2]
+    fires, slope, reason = collector.credit_verdict(two_points)
+    assert not fires and slope is None and "no verdict is claimed" in reason, \
+        "self-test failed: with too few datapoints the collector must decline to " \
+        "judge rather than guess -> %s" % reason
+
+    # ---- 7. NEGATIVE: null is allowed, absent is not ----
+    # The distinction the fix rests on. "We looked and there was no history" is
+    # a claim; a missing key is nobody having filled it in. If both were
+    # accepted the reader could no longer tell them apart.
+    base = json.loads(json.dumps(snap))
+    base["metrics"][0]["baseline"] = None
+    assert not validate_signals(base), \
+        "self-test failed: an explicit null baseline must be accepted"
+
+    missing = json.loads(json.dumps(snap))
+    del missing["metrics"][0]["baseline"]
+    absent_problems = validate_signals(missing)
+    scores["missing-baseline-is-red"] = bool(absent_problems)
+    assert absent_problems, \
+        "self-test failed: a metric with NO baseline key must be RED"
+    assert any("baseline" in problem for problem in absent_problems), \
+        "self-test failed: the violation must name the missing field -> %s" % absent_problems
 
     return scores, barren_message
 
