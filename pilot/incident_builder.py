@@ -100,6 +100,27 @@ def _spans(stamp, moment):
     return stamp <= moment < stamp + timedelta(seconds=BUCKET_SECONDS)
 
 
+def _require_zone(stamp):
+    """
+    A datetime with no timezone is refused, never assumed to be UTC.
+
+    Assuming is how a series ended up six hours away from the window that
+    described it: every value was tz-aware and correct, and the rendering
+    silently used whichever clock the machine happened to have.
+    """
+    if stamp.tzinfo is None or stamp.tzinfo.utcoffset(stamp) is None:
+        raise BuilderError(
+            "a timestamp has no timezone: %r. Reading it would mean guessing "
+            "its clock, and this prompt declares UTC." % stamp)
+    return stamp
+
+
+def _utc_hhmm(stamp) -> str:
+    """HH:MM in UTC, always, whatever zone the value arrived in."""
+    from datetime import timezone
+    return _require_zone(stamp).astimezone(timezone.utc).strftime("%H:%M")
+
+
 def _format_series(points, window_start, window_end):
     """
     Datapoints as text, with the transitions marked and gaps named.
@@ -124,21 +145,41 @@ def _format_series(points, window_start, window_end):
     checks. This function's job is to PRESENT data, not to narrate it -- saying a
     service stopped is already a conclusion, and the conclusion is what the agent
     is being asked for.
+
+    Every clock face here is UTC, converted explicitly
+    --------------------------------------------------
+    The first live build printed the summary in UTC and the series in the
+    operator's local time, six hours apart, and called both of them the window.
+    The arithmetic was right -- the timestamps were tz-aware, so the markers
+    landed in the correct buckets -- and the OUTPUT was incoherent: an agent
+    asked to align "03:46 to 03:56 UTC" against rows labelled 20:46 to 22:11 has
+    been handed two clocks and told they are one.
+
+    So the conversion is explicit, and a naive timestamp is refused rather than
+    assumed to be UTC. Assuming is how the six hours got in.
     """
+    # Validate every timestamp BEFORE any comparison. Putting this check in the
+    # rendering step left it unreachable: `_spans` compares first, and comparing
+    # a naive datetime against an aware one raises TypeError -- a crash that
+    # names Python's type system instead of the actual problem, which is that a
+    # timestamp arrived without a clock.
+    for stamp, _value in points:
+        _require_zone(stamp)
+
     lines = []
     for stamp, value in points:
         mark = ""
         if _spans(stamp, window_start):
-            mark = "   <- the fault begins inside this datapoint: a transition, not a state"
+            mark = "   <- the incident window begins inside this datapoint: a transition, not a state"
         elif _spans(stamp, window_end):
             mark = "   <- the window ends inside this datapoint: a transition, not a state"
-        lines.append("    %s  %10.0f%s" % (stamp.strftime("%H:%M"), value, mark))
+        lines.append("    %s  %10.0f%s" % (_utc_hhmm(stamp), value, mark))
 
     if points:
         last = points[-1][0]
         if last < window_end:
             lines.append("    (no datapoints after %s. Absent data is not a value "
-                         "of zero.)" % last.strftime("%H:%M"))
+                         "of zero.)" % _utc_hhmm(last))
     return "\n".join(lines)
 
 
@@ -176,8 +217,8 @@ def build(entry: dict, nodes: dict, metrics: dict, fault_role: str,
 
     title = TITLE.format(incident_id=entry["incident_id"], node=node)
     summary = SUMMARY.format(node=node,
-                             start=window_start.strftime("%H:%M"),
-                             end=window_end.strftime("%H:%M"))
+                             start=_utc_hhmm(window_start),
+                             end=_utc_hhmm(window_end))
     arm_a = "%s\n\n%s" % (title, summary)
 
     # --- arm B: the same text, then context -------------------------------

@@ -93,8 +93,8 @@ def run() -> int:
           ib.symptomatic_node("web", NODES) == "web")
 
     # ---- the two arms ----
-    built = ib.build(entry(), NODES,
-                     metrics(collapse_from={"web", "app"}, stopped={"db"}), "db")
+    FIXTURE = metrics(collapse_from={"web", "app"}, stopped={"db"})
+    built = ib.build(entry(), NODES, FIXTURE, "db")
 
     check("arm A is contained verbatim in arm B", built["arm_a"] in built["arm_b"])
     check("arm A carries no metrics", "NetworkIn" not in built["arm_a"])
@@ -113,11 +113,59 @@ def run() -> int:
 
     # ---- the transition datapoint is labelled, and ONLY it ----
     check("the datapoint spanning the injection is marked as a transition",
-          "the fault begins inside this datapoint" in built["arm_b"])
+          "the incident window begins inside this datapoint" in built["arm_b"])
+    # The marker appears in EVERY node's series at the same wall-clock bucket,
+    # including nodes that never failed. Calling it "the fault begins" there
+    # invited reading it as an accusation of the node whose column it sat in.
+    # It marks the window, so it says window.
+    check("the marker describes the window, not a fault in the node it sits on",
+          "the fault begins inside" not in built["arm_b"])
     marks = built["arm_b"].count("transition, not a state")
     check("the marker is not sprayed across the whole window",
           marks <= 2 * len(NODES),
           "%d markers — a marker on every row points at nothing" % marks)
+
+    # ---- the two clocks must be one clock ----
+    # The first live build declared the window in UTC and printed the series in
+    # the operator's local time, six hours away. Every timestamp was tz-aware,
+    # so every comparison was correct and every marker landed in the right
+    # bucket -- the arithmetic was never wrong. Only the rendering was, and no
+    # test looked at the rendering, because the tests built their fixtures in
+    # UTC and could not tell the two apart.
+    #
+    # So: the same instants, expressed in a zone that is not UTC.
+    from datetime import timezone as _tz, timedelta as _td
+    minus_six = _tz(_td(hours=-6))
+    shifted = {role: {name: [(stamp.astimezone(minus_six), value)
+                             for stamp, value in points]
+                      for name, points in per_metric.items()}
+               for role, per_metric in FIXTURE.items()}
+    elsewhere = ib.build(entry(), NODES, shifted, "db")
+
+    check("a series in another zone renders in UTC, not in the zone it arrived in",
+          elsewhere["arm_b"] == built["arm_b"],
+          "the same instants produced different text depending on their tzinfo")
+
+    declared = T0.strftime("%H:%M")
+    marked = [line.strip().split()[0] for line in elsewhere["arm_b"].splitlines()
+              if "the incident window begins inside" in line]
+    check("the marked datapoint and the declared window agree on the clock",
+          marked and all(mark <= declared for mark in marked) and len(set(marked)) == 1,
+          "summary says %s, series marks %s" % (declared, marked))
+
+    # NEGATIVE: a timestamp with no zone must be refused, not assumed to be UTC.
+    naive = {role: {name: [(stamp.replace(tzinfo=None), value)
+                           for stamp, value in points]
+                    for name, points in per_metric.items()}
+             for role, per_metric in FIXTURE.items()}
+    try:
+        ib.build(entry(), NODES, naive, "db")
+    except ib.BuilderError as exc:
+        check("a timestamp with no timezone is refused rather than guessed",
+              "no timezone" in str(exc), str(exc))
+    else:
+        check("a timestamp with no timezone is refused rather than guessed",
+              False, "it rendered -- which is exactly how the six hours got in")
 
     # ---- a stopped node's gap is stated, not left as a silence ----
     check("a series that ends early says so, rather than trailing off",
