@@ -137,13 +137,53 @@ RESTORE_ATTEMPTS = 3
 RESTORE_BACKOFF_S = (15, 45, 90)
 
 
-def current_state(ec2, instance_id: str) -> str:
+POLL_INTERVAL_S = 10
+
+
+class StateWaitTimeout(InjectionError):
+    """A wait that ran out of time, carrying what was actually observed.
+
+    On 3 Sep 2026 three restore attempts printed the same sentence:
+
+        i-0460bd1bda7ca477f did not reach state 'running' within 300s.
+
+    That sentence names the state that did NOT happen. Absence is not an
+    observation, and three very different faults render identically under it:
+    AWS refused the start and the instance never left `stopped`; the start was
+    accepted and the instance hung in `pending`; the instance was still
+    `stopping` when the start was issued. Nothing in the record said which.
+
+    This exception carries the observation instead: the states actually seen,
+    in order, and — when the instance is sitting in `stopped` — the reason AWS
+    gives for it being there.
+    """
+
+    def __init__(self, instance_id: str, wanted: str, observation: dict):
+        self.instance_id = instance_id
+        self.wanted = wanted
+        self.observation = observation
+        super().__init__(observation["message"])
+
+
+def observe_state(ec2, instance_id: str) -> tuple[str, str]:
+    """Return (state, StateTransitionReason) exactly as the API reports them.
+
+    `StateTransitionReason` is the field that distinguishes "stopped because
+    somebody stopped it" from "stopped because Server.InternalError", and it is
+    the single most useful string in a failed restore. It is absent from a
+    running instance and from most fakes, hence the `.get`.
+    """
     got = ec2.describe_instances(InstanceIds=[instance_id])
-    return got["Reservations"][0]["Instances"][0]["State"]["Name"]
+    inst = got["Reservations"][0]["Instances"][0]
+    return inst["State"]["Name"], (inst.get("StateTransitionReason") or "").strip()
+
+
+def current_state(ec2, instance_id: str) -> str:
+    return observe_state(ec2, instance_id)[0]
 
 
 def start_with_retries(ec2, instance_id: str, attempts: int = RESTORE_ATTEMPTS,
-                       sleeper=time.sleep, timeout_s: int = 300):
+                       sleeper=time.sleep, timeout_s: int = 300, clock=time.time):
     """
     Start the instance, and mean it.
 
@@ -156,33 +196,143 @@ def start_with_retries(ec2, instance_id: str, attempts: int = RESTORE_ATTEMPTS,
 
     One attempt is not a serious effort to recover from a transient failure.
 
-    Returns (running, attempts_made, restored_at, errors).
+    The retry POLICY is deliberately untouched by IA-56. Retrying is not what
+    failed on 3 Sep; understanding is. What changed is that every attempt now
+    returns an observation — the states seen, in order — instead of a string
+    saying which state did not arrive. Three identical sentences told us
+    nothing three times.
+
+    Returns (running, attempts_made, restored_at, observations), where each
+    observation is a JSON-serialisable dict destined for the incident's close
+    record. stderr is a place to notice a failure, not a place to keep it.
     """
-    errors = []
+    observations: list[dict] = []
     for attempt in range(1, attempts + 1):
         try:
             ec2.start_instances(InstanceIds=[instance_id])
-            wait_for_state(ec2, instance_id, "running", timeout_s=timeout_s)
-            return True, attempt, datetime.now(timezone.utc), errors
+            obs = wait_for_state(ec2, instance_id, "running",
+                                 timeout_s=timeout_s, sleeper=sleeper, clock=clock)
+            obs["attempt"] = attempt
+            observations.append(obs)
+            return True, attempt, datetime.now(timezone.utc), observations
+        except StateWaitTimeout as exc:
+            obs = dict(exc.observation)
+            obs["attempt"] = attempt
+            obs["error_type"] = type(exc).__name__
+            observations.append(obs)
         except Exception as exc:  # noqa: BLE001 - every failure is data
-            errors.append("attempt %d: %s: %s" % (attempt, type(exc).__name__, exc))
-            print("  restore attempt %d failed: %s" % (attempt, exc), file=sys.stderr)
-            if attempt < attempts:
-                pause = RESTORE_BACKOFF_S[min(attempt - 1, len(RESTORE_BACKOFF_S) - 1)]
-                print("  retrying in %ds" % pause, file=sys.stderr)
-                sleeper(pause)
-    return False, attempts, None, errors
+            # StartInstances itself refused. The state is still worth having:
+            # a refusal against a `stopping` instance and a refusal against a
+            # `stopped` one are different problems.
+            try:
+                last, reason = observe_state(ec2, instance_id)
+            except Exception:  # noqa: BLE001 - an unobservable instance is data too
+                last, reason = "unobservable", ""
+            observations.append({
+                "outcome": "api_error",
+                "waiting_for": "running",
+                "attempt": attempt,
+                "error_type": type(exc).__name__,
+                "last_state": last,
+                "states_seen": [last],
+                "progressed": False,
+                "state_transition_reason": reason,
+                "polls": 0,
+                "waited_s": 0.0,
+                "message": "%s: %s (instance is '%s'%s)" % (
+                    type(exc).__name__, exc, last,
+                    "; StateTransitionReason: " + reason if last == "stopped" and reason else "",
+                ),
+            })
+        print("  restore attempt %d failed: %s" % (attempt, observations[-1]["message"]),
+              file=sys.stderr)
+        if attempt < attempts:
+            pause = RESTORE_BACKOFF_S[min(attempt - 1, len(RESTORE_BACKOFF_S) - 1)]
+            print("  retrying in %ds" % pause, file=sys.stderr)
+            sleeper(pause)
+    return False, attempts, None, observations
 
 
-def wait_for_state(ec2, instance_id: str, state: str, timeout_s: int = 300) -> None:
-    deadline = time.time() + timeout_s
-    while time.time() < deadline:
-        got = ec2.describe_instances(InstanceIds=[instance_id])
-        now = got["Reservations"][0]["Instances"][0]["State"]["Name"]
+def wait_for_state(ec2, instance_id: str, state: str, timeout_s: int = 300,
+                   sleeper=time.sleep, clock=time.time) -> dict:
+    """Wait for `state`, and report what was seen rather than what was missed.
+
+    Returns an observation dict on success and raises StateWaitTimeout — which
+    carries the same shape — on timeout. Either way the caller can answer the
+    question the old harness could not: what was the instance actually doing?
+
+    The deadline is checked AFTER the first poll, so an observation always
+    exists. A wait that reports nothing at all is the defect this fixes.
+    """
+    started = clock()
+    deadline = started + timeout_s
+    seen: list[str] = []
+    reason = ""
+    polls = 0
+    while True:
+        now, reason = observe_state(ec2, instance_id)
+        polls += 1
+        if not seen or seen[-1] != now:
+            seen.append(now)
         if now == state:
-            return
-        time.sleep(10)
-    raise InjectionError(f"{instance_id} did not reach state '{state}' within {timeout_s}s.")
+            return _observation(instance_id, state, seen, reason, polls,
+                                round(clock() - started, 1), reached=True)
+        if clock() >= deadline:
+            break
+        sleeper(POLL_INTERVAL_S)
+
+    raise StateWaitTimeout(
+        instance_id, state,
+        _observation(instance_id, state, seen, reason, polls,
+                     round(clock() - started, 1), reached=False),
+    )
+
+
+def _observation(instance_id: str, wanted: str, seen: list[str], reason: str,
+                 polls: int, waited_s: float, reached: bool) -> dict:
+    """Render one wait as structured data plus one sentence a human can act on.
+
+    Three outcomes, three different sentences — which is the whole point:
+
+      reached    the path is named, so a slow boot reads as a slow boot;
+      no motion  the instance never left its starting state, so the start was
+                 refused or never took effect — retrying is plausible;
+      stalled    the instance began changing state and did not finish, so it is
+                 AWS that is stuck, and a fourth attempt would not help.
+    """
+    path = " -> ".join(seen)
+    last = seen[-1]
+    progressed = len(seen) > 1
+    if reached:
+        outcome = "reached"
+        message = (f"{instance_id} reached '{wanted}' after {waited_s}s "
+                   f"({polls} polls) via {path}.")
+    elif not progressed:
+        outcome = "no_motion"
+        message = (f"{instance_id} never left '{last}' while waiting for "
+                   f"'{wanted}': {waited_s}s, {polls} polls, no state change at all.")
+    else:
+        outcome = "stalled"
+        message = (f"{instance_id} went {path} while waiting for '{wanted}': it "
+                   f"began changing state and did not finish within {waited_s}s "
+                   f"({polls} polls).")
+    # The reason AWS gives for an instance being stopped is the difference
+    # between "the operator stopped it" and "Server.InternalError". Report it
+    # whenever the instance is sitting in `stopped`, which is the only state
+    # for which it is both populated and meaningful.
+    if last == "stopped" and reason:
+        message += f" StateTransitionReason: {reason}"
+    return {
+        "outcome": outcome,
+        "waiting_for": wanted,
+        "last_state": last,
+        "states_seen": seen,
+        "progressed": progressed,
+        "state_transition_reason": reason,
+        "polls": polls,
+        "waited_s": waited_s,
+        "message": message,
+    }
 
 
 # `ensure_running` was removed when the chain landed. It used to start a stopped
@@ -329,12 +479,19 @@ def main(argv=None) -> int:
         details = {}
         if args.fault == "F3" and not args.dry_run:
             print("  restoring: starting the instance again")
-            restored, tries, restored_at, errors = start_with_retries(ec2, instance_id)
+            restored, tries, restored_at, observations = start_with_retries(ec2, instance_id)
             details["restore_attempts"] = tries
             details["service_restored_at"] = restored_at.isoformat() if restored_at else None
+            # Criterion 2 of IA-56: the observations go into the record as
+            # structured data. A failure that exists only in a terminal
+            # scrollback is a failure that cannot be scored later.
+            details["restore_observations"] = observations
             if not restored:
                 outcome = "failed"
-                notes = (notes + " | " if notes else "") + "restore failed: " + "; ".join(errors)
+                notes = (notes + " | " if notes else "") + "restore failed: " + "; ".join(
+                    "attempt %s (%s): %s" % (o.get("attempt"), o.get("outcome"), o["message"])
+                    for o in observations
+                )
 
         if not args.dry_run:
             try:
