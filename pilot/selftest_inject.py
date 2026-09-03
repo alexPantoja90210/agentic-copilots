@@ -50,6 +50,24 @@ class FakeEC2:
         ]}]}
 
 
+class _FakeChain:
+    """Tagged instances as describe_instances returns them."""
+
+    def __init__(self, spec):
+        self.spec = spec
+
+    def describe_instances(self, Filters=None, **kwargs):  # noqa: N803
+        instances = []
+        for role, (iid, upstream, state) in self.spec.items():
+            tags = [{"Key": "Pilot", "Value": "IA-45"},
+                    {"Key": "ChainRole", "Value": role}]
+            if upstream:
+                tags.append({"Key": "DependsOn", "Value": upstream})
+            instances.append({"InstanceId": iid, "State": {"Name": state},
+                              "PrivateIpAddress": "10.0.0.1", "Tags": tags})
+        return {"Reservations": [{"Instances": instances}]}
+
+
 def check(name, condition, detail=""):
     results.append((name, PASS if condition else FAIL, "" if condition else detail))
 
@@ -94,6 +112,40 @@ def run() -> int:
     running = FakeEC2(state="running")
     check("a healthy target reports running",
           inject.current_state(running, "i-0test") == "running")
+
+    # ---- IA-55 aftermath: the target is a ROLE, not the only tagged instance ----
+    # Before this, resolve_target refused whenever it found more than one tagged
+    # instance. Correct with one node; a wall with three, and the harness could
+    # not inject anything at all.
+    chain = _FakeChain({
+        "db":  ("i-0db",  None,  "running"),
+        "app": ("i-0app", "db",  "running"),
+        "web": ("i-0web", "app", "running"),
+    })
+    nodes, role = inject.resolve_target(chain, "app")
+    check("a node is resolved by its role", role == "app" and nodes[role]["instance_id"] == "i-0app")
+    check("and the graph comes back with it", set(nodes) == {"db", "app", "web"})
+
+    try:
+        inject.resolve_target(chain, None)
+    except inject.InjectionError as exc:
+        check("with several nodes, omitting the role is refused",
+              "--node" in str(exc), str(exc))
+    else:
+        check("with several nodes, omitting the role is refused", False,
+              "it guessed — which service fails is the experiment's variable")
+
+    try:
+        inject.resolve_target(chain, "cache")
+    except inject.InjectionError as exc:
+        check("an unknown role is refused, and the known ones are listed",
+              "db" in str(exc) and "web" in str(exc), str(exc))
+    else:
+        check("an unknown role is refused", False, "no error")
+
+    single = _FakeChain({"db": ("i-0db", None, "running")})
+    _, only = inject.resolve_target(single, None)
+    check("with exactly one node, the role may be omitted", only == "db")
 
     width = max(len(n) for n, _, _ in results)
     failed = 0

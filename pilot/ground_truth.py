@@ -124,8 +124,16 @@ def open_incident(
     operator: str,
     path: Path = DEFAULT_LOG,
     dry_run: bool = False,
+    details: dict | None = None,
 ) -> dict:
-    """Write the label. Called BEFORE the fault is induced — never after."""
+    """
+    Write the label. Called BEFORE the fault is induced — never after.
+
+    `details` carries what the label MEANS rather than how it was produced: the
+    node's role, the graph it sat in. An instance id is not something a scorer
+    can compare an answer against, and this account closes in February 2027 —
+    after which an id resolves to nothing while a role still reads.
+    """
     if fault not in FAULT_CLASSES:
         raise GroundTruthError(f"Unknown fault {fault!r}. Known: {sorted(FAULT_CLASSES)}")
     if window_end_planned <= window_start:
@@ -156,6 +164,11 @@ def open_incident(
         "dry_run": dry_run,
         "written_at": _utc(),
     }
+    for key, value in (details or {}).items():
+        if key in record:
+            raise GroundTruthError(
+                "details may not overwrite the field %r of an open record" % key)
+        record[key] = value
     return _append(record, path)
 
 

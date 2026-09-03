@@ -28,6 +28,7 @@ import time
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import chain_topology as ct
 import ground_truth as gt
 
 REGION = "us-east-1"
@@ -76,31 +77,39 @@ def session(injector_role_arn: str | None):
     )
 
 
-def resolve_target(ec2, instance_id: str | None) -> dict:
-    """Find the pilot target and prove it is the pilot target."""
-    filters = [{"Name": f"tag:{PILOT_TAG_KEY}", "Values": [PILOT_TAG_VALUE]}]
-    kwargs = {"Filters": filters}
-    if instance_id:
-        kwargs["InstanceIds"] = [instance_id]
+def resolve_target(ec2, role: str | None = None):
+    """
+    Find the node to break, by its ROLE in the dependency chain.
 
-    reservations = ec2.describe_instances(**kwargs).get("Reservations", [])
-    found = [i for r in reservations for i in r.get("Instances", [])
-             if i["State"]["Name"] != "terminated"]
+    Until IA-55 the pilot had one instance and this function refused whenever it
+    found more than one, which was correct then and became a wall the moment the
+    chain existed: three tagged instances, and the harness could not inject
+    anything at all.
 
-    if not found:
+    Roles rather than instance ids, because the role is what the experiment is
+    about. "Stop the database" survives the machine being replaced; an id does
+    not, and IA-46 already replaced this account's instance once.
+
+    Returns (nodes, role) with the topology alongside, since every caller that
+    needs a target also needs the graph the target sits in.
+    """
+    nodes = ct.discover(ec2)
+
+    if role is None:
+        if len(nodes) == 1:
+            role = next(iter(nodes))
+        else:
+            raise InjectionError(
+                "this account has %d pilot nodes (%s). Name the one to break with "
+                "--node: which service fails is the experiment's variable, not "
+                "something for the harness to choose."
+                % (len(nodes), ", ".join(sorted(nodes))))
+
+    if role not in nodes:
         raise InjectionError(
-            f"No non-terminated instance carries {PILOT_TAG_KEY}={PILOT_TAG_VALUE}. "
-            "Set pilot_enabled = true in terraform.tfvars and apply, or pass the "
-            "instance id explicitly once it is tagged. This harness will not act on "
-            "an untagged instance."
-        )
-    if len(found) > 1:
-        ids = ", ".join(i["InstanceId"] for i in found)
-        raise InjectionError(
-            f"{len(found)} instances carry the pilot tag ({ids}). The pilot targets "
-            "exactly one; refusing to guess."
-        )
-    return found[0]
+            f"'{role}' is not a node in this graph. Known roles: "
+            + ", ".join(sorted(nodes)))
+    return nodes, role
 
 
 def assert_standard_credits(ec2, instance_id: str) -> str:
@@ -176,20 +185,14 @@ def wait_for_state(ec2, instance_id: str, state: str, timeout_s: int = 300) -> N
     raise InjectionError(f"{instance_id} did not reach state '{state}' within {timeout_s}s.")
 
 
-def ensure_running(ec2, instance_id: str, dry_run: bool) -> None:
-    state = ec2.describe_instances(InstanceIds=[instance_id])["Reservations"][0]["Instances"][0]["State"]["Name"]
-    if state == "running":
-        return
-    if dry_run:
-        print(f"[dry-run] would start {instance_id} (currently {state})")
-        return
-    print(f"  starting {instance_id} (currently {state})")
-    ec2.start_instances(InstanceIds=[instance_id])
-    wait_for_state(ec2, instance_id, "running")
-    # CloudWatch needs a few minutes of a running instance before the window is
-    # meaningful. Starting inside the window would put the boot in the metrics.
-    print("  waiting 180s for metrics to settle before the window opens")
-    time.sleep(180)
+# `ensure_running` was removed when the chain landed. It used to start a stopped
+# target and wait three minutes for metrics to settle. With three nodes that
+# behaviour became wrong, not merely unused: starting a chain and injecting
+# immediately would open the window before the traffic had stabilised, and the
+# first datapoints would record the bootstrap rather than the system. The harness
+# now REFUSES a chain that is not already up, and the operator starts it and
+# lets it settle. Recorded here because deleting a function silently invites
+# somebody to write it again.
 
 
 def burn_cpu(ssm, instance_id: str, seconds: int, dry_run: bool) -> None:
@@ -229,43 +232,49 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="Inject one labelled fault for the IA-45 pilot.")
     ap.add_argument("fault", choices=sorted(gt.FAULT_CLASSES))
     ap.add_argument("--duration", type=int, default=12, help="fault duration in minutes")
-    ap.add_argument("--instance", default=None, help="instance id; resolved from the pilot tag if omitted")
+    ap.add_argument("--node", default=None,
+                    help="which service to break: a ChainRole such as db, app or web")
     ap.add_argument("--injector-role-arn", default=None, help="role to assume; omit to use ambient credentials")
     ap.add_argument("--operator", default="alejandro", help="who ran it, recorded in the label")
     ap.add_argument("--dry-run", action="store_true", help="every step except the fault itself")
     args = ap.parse_args(argv)
 
     seconds = args.duration * 60
-    incident_id = f"{args.fault}-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}"
 
     sess = session(args.injector_role_arn)
     ec2 = sess.client("ec2")
     ssm = sess.client("ssm")
 
-    target = resolve_target(ec2, args.instance)
-    instance_id = target["InstanceId"]
-    print(f"target: {instance_id} ({target['InstanceType']}, {target['State']['Name']})")
+    nodes, role = resolve_target(ec2, args.node)
+    # The id names the service. Two F3s on different nodes are different
+    # incidents with different correct answers, and an identifier that cannot
+    # tell them apart makes the log ambiguous exactly where it must not be.
+    incident_id = f"{args.fault}-{role}-{datetime.now(timezone.utc):%Y%m%dT%H%M%S}"
+    instance_id = nodes[role]["instance_id"]
+    print(ct.describe(nodes))
+    print()
+    print(f"target: {role} ({nodes[role]['state']})")
+
+    # Every node must be up before the fault. An incident injected while some
+    # OTHER node is already down carries two faults under one label, and the
+    # second one is invisible: nothing in the metrics distinguishes "app is
+    # quiet because I stopped db just now" from "app was quiet all along".
+    #
+    # This is the case the single-node pre-flight could not see. It checked the
+    # target; the chain means the target is not the only thing that can be wrong.
+    if not args.dry_run:
+        down = sorted(r for r, n in nodes.items() if n["state"] != "running")
+        if down:
+            raise InjectionError(
+                "these services are not running: %s. Refusing to open a window: "
+                "the incident would carry more than one fault under a single "
+                "label, and the extra one leaves no trace a reader could find. "
+                "Start the whole chain, let it settle, and try again."
+                % ", ".join(down))
 
     if args.fault in ("F1", "F2"):
         mode = assert_standard_credits(ec2, instance_id)
         print(f"credit mode: {mode}")
-
-    # IA-52, criterion 5. A previous run whose restore failed leaves the target
-    # stopped. Opening a window against a stopped instance would produce a
-    # labelled incident whose signal is the LAST failure, not this one -- a
-    # contaminated data point that looks exactly like a clean one.
-    #
-    # So the state is confirmed, not assumed, before any label is written.
-    ensure_running(ec2, instance_id, args.dry_run)
-    if not args.dry_run:
-        state = current_state(ec2, instance_id)
-        if state != "running":
-            raise InjectionError(
-                f"{instance_id} is '{state}', not running, and could not be started. "
-                "Refusing to open a window: the incident would carry the previous "
-                "failure's signal under this run's label. Start it by hand, confirm "
-                "it is running, and try again."
-            )
 
     window_start = datetime.now(timezone.utc)
     window_end_planned = window_start + timedelta(seconds=seconds)
@@ -288,8 +297,18 @@ def main(argv=None) -> int:
         operator=args.operator,
         dry_run=args.dry_run,
         path=log_path,
+        details={
+            # The role IS the answer the pilot scores against. An instance id
+            # cannot be scored -- and R1 closes this account in February, after
+            # which an id resolves to nothing while a role still reads.
+            "node_role": role,
+            # The graph as it stood when the fault was injected. Recorded rather
+            # than re-derived later, because a label that depends on querying a
+            # live account is a label with an expiry date.
+            "topology": {r: n["depends_on"] for r, n in nodes.items()},
+        },
     )
-    print(f"label written: {incident_id} ({gt.FAULT_CLASSES[args.fault]})")
+    print(f"label written: {incident_id} — {gt.FAULT_CLASSES[args.fault]} on {role}")
 
     outcome, notes = "completed", ""
     try:
