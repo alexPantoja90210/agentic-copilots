@@ -163,6 +163,25 @@ def _query_points(client, namespace, metric_name, instance_id, start, end, perio
     return sorted(points, key=lambda point: point["Timestamp"])
 
 
+def series(client, metric_name, instance_id, start, end,
+           period=300, namespace="AWS/EC2"):
+    """
+    One metric's datapoints for one instance as [(datetime, value), ...].
+
+    The public way to ask this module for a SERIES rather than a snapshot. The
+    pilot's incident builder needs the shape of a window, not a verdict about
+    it, and it must reach CloudWatch through the same code path as everything
+    else -- a second, private caller is a second set of assumptions about
+    periods, statistics and ordering that nothing keeps in step.
+
+    `period` defaults to 300 because EC2 basic monitoring publishes every five
+    minutes and asking for 60 returns an emptier series, not a finer one.
+    """
+    points = _query_points(client, namespace, metric_name, instance_id,
+                           start, end, period)
+    return [(point["Timestamp"], point[STATISTIC]) for point in points]
+
+
 def _query(client, namespace, metric_name, instance_id, start, end, period):
     points = _query_points(client, namespace, metric_name, instance_id,
                            start, end, period)

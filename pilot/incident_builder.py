@@ -142,11 +142,31 @@ def _format_series(points, window_start, window_end):
     return "\n".join(lines)
 
 
-def build(entry: dict, nodes: dict, metrics: dict, fault_role: str) -> dict:
+def build(entry: dict, nodes: dict, metrics: dict, fault_role: str,
+          uniform_terms: tuple = ()) -> dict:
     """
-    entry    one 'open' record from the ground-truth log
-    nodes    chain_topology.discover() output
-    metrics  {role: {metric_name: [(datetime, value), ...]}}
+    entry          one 'open' record from the ground-truth log
+    nodes          chain_topology.discover() output
+    metrics        {role: {metric_name: [(datetime, value), ...]}}
+    uniform_terms  strings that appear IDENTICALLY in every incident -- metric
+                   names, column headings -- and are therefore exempt from the
+                   leak check.
+
+    On uniform_terms, because the exemption is dangerous if misunderstood
+    ------------------------------------------------------------------------
+    `leaks()` looks for words that would hand over the answer, and 'cpu' is one
+    of them: a summary reading "cpu saturation on web" has told the model the
+    fault class. But arm B also carries a metric called `CPUUtilization`, for
+    EVERY incident, whatever its fault. The detector could not tell those two
+    apart and refused the F1 incident.
+
+    A term that appears in every incident cannot distinguish between them, so it
+    carries no information about the label. That is the entire justification,
+    and it holds only while the term really is uniform. Pass a term here that is
+    chosen per fault class and the exemption becomes the hole it was meant to
+    close -- which is why `build_incidents.METRICS` is a module constant and
+    `selftest_build.py` asserts that two different fault classes produce prompts
+    carrying the same metric names.
     """
     from datetime import datetime
 
@@ -191,8 +211,13 @@ def build(entry: dict, nodes: dict, metrics: dict, fault_role: str) -> dict:
             "more than the added context, and any measured difference could no "
             "longer be attributed to context alone.")
 
+    # Arm A is prose we generated and is checked whole -- no exemptions, because
+    # nothing in it is furniture. Arm B has the metric table stripped first.
+    scrubbed_b = arm_b
+    for term in uniform_terms:
+        scrubbed_b = scrubbed_b.replace(term, "")
     leaked = (leaks(entry["fault"], fault_role, node, arm_a)
-              | leaks(entry["fault"], fault_role, node, arm_b))
+              | leaks(entry["fault"], fault_role, node, scrubbed_b))
     if leaked:
         raise BuilderError(
             "the prompt gives away the answer: %s. Refusing to build an incident "
