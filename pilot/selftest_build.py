@@ -202,8 +202,26 @@ def run() -> int:
     check("and the record says which fault and which node it was",
           near_by_id["F0-web-N"]["contaminated_by"][0]["fault"] == "F3"
           and near_by_id["F0-web-N"]["contaminated_by"][0]["node_role"] == "db")
-    check("the contamination is mutual, so both incidents carry it",
-          len(near_by_id["F3-db-N"]["contaminated_by"]) == 1)
+    # NOT mutual, and that asymmetry is the point. A control induces nothing, so
+    # its window carries no foreign event into anybody else's prompt. It still
+    # needs protecting itself -- more than anything else does, since its whole
+    # claim is that its window was empty.
+    check("a control does not contaminate its neighbour, having no signal to lend",
+          near_by_id["F3-db-N"]["contaminated_by"] == [],
+          str(near_by_id["F3-db-N"]["contaminated_by"]))
+
+    # Between two REAL faults it stays mutual: each one's event sits in the
+    # other's context.
+    both_real = [opened("F3-db-R", "F3", "db",
+                        start="2026-09-04T02:00:00+00:00", end="2026-09-04T02:25:00+00:00"),
+                 closed("F3-db-R"),
+                 opened("F1-web-R", "F1", "web",
+                        start="2026-09-04T02:26:00+00:00", end="2026-09-04T02:51:00+00:00"),
+                 closed("F1-web-R")]
+    built_real, _ = bi.build_all(both_real, nodes, FakeCloudWatch())
+    check("between two real faults the contamination is mutual",
+          all(len(i["contaminated_by"]) == 1 for i in built_real),
+          str([(i["incident_id"], i["contaminated_by"]) for i in built_real]))
 
     far = [opened("F3-db-F", "F3", "db",
                   start="2026-09-04T02:00:00+00:00", end="2026-09-04T02:25:00+00:00"),

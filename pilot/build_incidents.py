@@ -134,6 +134,12 @@ def contaminants(entry: dict, entries: list[dict]) -> list[dict]:
             continue
         if other.get("dry_run"):
             continue
+        # A control induces nothing, so its window holds no foreign event. It
+        # occupies time and contributes no signal, and counting it as a
+        # contaminant overstates how crowded the corpus really is -- which
+        # would then overstate how much of it has to be injected again.
+        if other["fault"] in gt.SIGNAL_FREE_FAULTS:
+            continue
         start = datetime.fromisoformat(other["window_start"])
         closed = closes.get(other["incident_id"], {})
         end = datetime.fromisoformat(

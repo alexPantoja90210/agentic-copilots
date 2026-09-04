@@ -105,13 +105,22 @@ def _append(record: dict, path: Path) -> dict:
     return record
 
 
-def _windows(entries: list[dict]) -> list[tuple[datetime, datetime, str]]:
-    """(start, end, incident_id) for every OPEN record. End is the planned one."""
+# Faults that induce nothing. Their windows occupy time and produce no signal,
+# so they cannot contaminate anybody else's context -- there is no foreign event
+# inside them to be seen. They still need protecting themselves, and more than
+# anything else does: the control's whole purpose is that its window is empty,
+# and a neighbour's outage bleeding into its lead-in is what destroys it.
+SIGNAL_FREE_FAULTS = frozenset({"F0"})
+
+
+def _windows(entries: list[dict]) -> list[tuple[datetime, datetime, str, str]]:
+    """(start, end, incident_id, fault) for every OPEN record. End is the planned one."""
     out = []
     for e in entries:
         if e.get("record") != "open":
             continue
-        out.append((_parse(e["window_start"]), _parse(e["window_end_planned"]), e["incident_id"]))
+        out.append((_parse(e["window_start"]), _parse(e["window_end_planned"]),
+                    e["incident_id"], e.get("fault", "")))
     return out
 
 
@@ -152,7 +161,8 @@ def open_incident(
     pre = timedelta(minutes=context_pre_minutes)
     post = timedelta(minutes=context_post_minutes)
     conflicts = []
-    for start, end, other in _windows(existing):
+    i_am_silent = fault in SIGNAL_FREE_FAULTS
+    for start, end, other, other_fault in _windows(existing):
         if window_start < end and start < window_end_planned:
             raise GroundTruthError(
                 f"Window [{_utc(window_start)} .. {_utc(window_end_planned)}] overlaps "
@@ -168,9 +178,13 @@ def open_incident(
         # Both directions matter. A neighbour inside my padding contaminates my
         # prompt; my window inside a neighbour's padding contaminates theirs,
         # and theirs was written first and cannot be fixed afterwards.
-        if start < window_end_planned + post and window_start - pre < end:
+        # Asymmetric on purpose. Two questions, and only one of them is about me.
+        they_are_silent = other_fault in SIGNAL_FREE_FAULTS
+        if (not they_are_silent
+                and start < window_end_planned + post and window_start - pre < end):
             conflicts.append((other, start, end, "their fault sits in my context window"))
-        elif window_start < end + post and start - pre < window_end_planned:
+        elif (not i_am_silent
+                and window_start < end + post and start - pre < window_end_planned):
             conflicts.append((other, start, end, "my fault sits in their context window"))
 
     if conflicts:

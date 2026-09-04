@@ -196,6 +196,47 @@ def run() -> int:
     expect_ok("RED confirmed: with no context declared, the same pair passes",
               place(fresh_with_a(context=False), padding_only, context=False))
 
+    # A control lends no signal, so it never pollutes a neighbour. But it is
+    # still protected in BOTH directions, and the tail is what a following fault
+    # lands in. So a fault after a control needs POST minutes of clearance, not
+    # zero -- the asymmetry buys the difference between PRE and POST, and
+    # nothing more. Written down because it was overstated once, out loud, as
+    # "controls can be slotted in for free".
+    def control_at(moment):
+        log = Path(tempfile.mkdtemp()) / "gt.jsonl"
+        gt.open_incident(incident_id="CTRL", fault="F0", instance_id="i-0x",
+                         window_start=moment,
+                         window_end_planned=moment + timedelta(minutes=25),
+                         operator="selftest", path=log,
+                         context_pre_minutes=PRE, context_post_minutes=POST)
+        return log
+
+    expect_ok("a fault may open POST minutes after a control ends",
+              place(control_at(base), base + timedelta(minutes=25 + POST), name="AFTER"))
+
+    expect_raises("but not one minute sooner: it would land in the control's tail",
+                  place(control_at(base), base + timedelta(minutes=25 + POST - 1),
+                        name="TOOSOON"),
+                  "my fault sits in their context window")
+
+    # The saving is real but narrower than PRE: after a control a fault waits
+    # POST, after a fault it waits PRE.
+    results.append((
+        "the clearance a control needs after it is smaller than after a fault",
+        PASS if POST < PRE else FAIL, ""))
+
+    # But the control itself is still protected, and harder than anything else:
+    # its whole claim is that its window was empty.
+    guarded = fresh_with_a()
+    expect_raises("a control is still refused next to a real fault",
+                  lambda: gt.open_incident(
+                      incident_id="CTRL2", fault="F0", instance_id="i-0x",
+                      window_start=base + timedelta(minutes=26),
+                      window_end_planned=base + timedelta(minutes=51),
+                      operator="selftest", path=guarded,
+                      context_pre_minutes=PRE, context_post_minutes=POST),
+                  "their fault sits in my context window")
+
     # The other direction: a window landing inside an EARLIER incident's tail.
     # It matters on its own, because that prompt was written first and cannot be
     # repaired afterwards.
