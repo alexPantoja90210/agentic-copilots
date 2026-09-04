@@ -169,8 +169,61 @@ def run() -> int:
 
     # ---- a stopped node's gap is stated, not left as a silence ----
     check("a series that ends early says so, rather than trailing off",
-          "no datapoints after" in built["arm_b"],
+          "no datapoint from" in built["arm_b"],
           "the gap IS the clue in a stop fault; leaving it as absent rows hides it")
+
+    # ---- IA-59: an absence in the MIDDLE gets the same sentence ----
+    # The function used to narrate a series that ended early and stay silent
+    # about a hole inside one. Same signal, two treatments -- and in the pilot's
+    # real data the unnarrated hole was the answer to the incident.
+    holed = metrics(collapse_from={"web", "app"}, stopped=set())
+    for name, points in holed["app"].items():
+        holed["app"][name] = points[:2] + points[5:]     # buckets 2,3,4 removed
+    with_hole = ib.build(entry(), NODES, holed, "db")
+
+    check("an absence in the middle of a series is named",
+          "no datapoint from" in with_hole["arm_b"],
+          "the hole is silent -- a reader has to spot missing timestamps by eye")
+    check("a run of missing datapoints states the span it covers",
+          with_hole["arm_b"].count("no datapoint from") >= 1
+          and " to " in [line for line in with_hole["arm_b"].splitlines()
+                         if "no datapoint from" in line][0],
+          [line for line in with_hole["arm_b"].splitlines() if "no datapoint" in line][:2])
+
+    single = metrics(collapse_from={"web", "app"}, stopped=set())
+    for name, points in single["app"].items():
+        single["app"][name] = points[:3] + points[4:]    # exactly one removed
+    with_one = ib.build(entry(), NODES, single, "db")
+    check("a single missing datapoint is named as one, not as a span",
+          "no datapoint at " in with_one["arm_b"],
+          [line for line in with_one["arm_b"].splitlines() if "no datapoint" in line][:2])
+
+    # RED: the pre-IA-59 rendering had no interior detection at all. Its only
+    # absence sentence was the trailing one, so on this fixture -- whose series
+    # runs to the end of the window -- it produced no absence sentence whatever.
+    def pre_ia59(points, window_start, window_end):
+        rows = []
+        for stamp, value in points:
+            rows.append("    %s  %10.0f" % (stamp.strftime("%H:%M"), value))
+        if points and points[-1][0] < window_end:
+            rows.append("    (no datapoints after %s.)" % points[-1][0].strftime("%H:%M"))
+        return "\n".join(rows)
+
+    hole_points = holed["app"]["NetworkIn"]
+    old_render = pre_ia59(hole_points, T0, T0 + timedelta(minutes=8))
+    new_render = ib._format_series(hole_points, T0, T0 + timedelta(minutes=8))
+    check("RED: the old rendering left this same hole entirely unmentioned",
+          "no datapoint" not in old_render and "no datapoint" in new_render,
+          "old=%r" % old_render)
+
+    check("a series with no gaps gains no absence sentences",
+          "no datapoint" not in ib._format_series(
+              metrics()["db"]["NetworkIn"], T0, T0 + timedelta(minutes=8)),
+          "a sentence on every row points at nothing")
+
+    check("the interior absence sentence survives the leak detector",
+          not ib.leaks("F3", "app", "web", with_hole["arm_b"]),
+          "naming an absence must stay an observation, not a conclusion")
     check("and the distinction from zero is spelled out",
           "not a value of zero" in built["arm_b"])
     check("the gap is described without using the fault's own vocabulary",

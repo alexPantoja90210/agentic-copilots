@@ -166,21 +166,63 @@ def _format_series(points, window_start, window_end):
     for stamp, _value in points:
         _require_zone(stamp)
 
+    from datetime import timedelta
+
     lines = []
+    previous = None
     for stamp, value in points:
+        if previous is not None:
+            gap = _absence(previous, stamp)
+            if gap:
+                lines.append(gap)
         mark = ""
         if _spans(stamp, window_start):
             mark = "   <- the incident window begins inside this datapoint: a transition, not a state"
         elif _spans(stamp, window_end):
             mark = "   <- the window ends inside this datapoint: a transition, not a state"
         lines.append("    %s  %10.0f%s" % (_utc_hhmm(stamp), value, mark))
+        previous = stamp
 
     if points:
         last = points[-1][0]
-        if last < window_end:
-            lines.append("    (no datapoints after %s. Absent data is not a value "
-                         "of zero.)" % _utc_hhmm(last))
+        if last + timedelta(seconds=BUCKET_SECONDS) <= window_end:
+            lines.append(_ABSENCE % ("from %s onwards" % _utc_hhmm(
+                last + timedelta(seconds=BUCKET_SECONDS))))
     return "\n".join(lines)
+
+
+# One sentence for every absence, wherever it falls. IA-59: the function used to
+# narrate a series that ENDED early and say nothing about a hole in the middle,
+# which are the same signal presented two ways -- and in the pilot's own data the
+# unnarrated hole was the answer to the incident.
+#
+# The wording is observational on purpose and has been litigated once already:
+# an earlier version said a service "stopped reporting" and the leak detector
+# refused the build, because "stop" is F3's own vocabulary. Naming an absence is
+# reporting an observation; saying why it is absent is the conclusion the agent
+# is being asked for.
+_ABSENCE = "    (no datapoint %s. Absent data is not a value of zero.)"
+
+
+def _absence(previous, stamp) -> str:
+    """
+    The sentence for the datapoints missing between two observations, if any.
+
+    Returns "" when the two are consecutive, because a sentence on every row
+    points at nothing -- the same reason the transition marker was narrowed to
+    two datapoints instead of the whole window.
+    """
+    from datetime import timedelta
+
+    bucket = timedelta(seconds=BUCKET_SECONDS)
+    missing_from = previous + bucket
+    if missing_from >= stamp:
+        return ""
+    missing_to = stamp - bucket
+    if missing_from == missing_to:
+        return _ABSENCE % ("at %s" % _utc_hhmm(missing_from))
+    return _ABSENCE % ("from %s to %s" % (_utc_hhmm(missing_from),
+                                          _utc_hhmm(missing_to)))
 
 
 def build(entry: dict, nodes: dict, metrics: dict, fault_role: str,
