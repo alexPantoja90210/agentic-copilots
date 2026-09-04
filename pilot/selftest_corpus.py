@@ -1,0 +1,199 @@
+"""
+Selftest for the injection sequencer.
+
+The property under test is not "it runs four commands". It is that the gaps it
+leaves are the gaps the BUILDER needs, that a control is charged less than a
+fault, and that a failure stops the sequence instead of marching on.
+
+The last one matters most: continuing past a failed injection is how a corpus
+acquires an incident nobody can explain, and the schedule would look complete
+while one of its windows never happened.
+
+No AWS, no waiting: the clock and the injector are both injected.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import ground_truth as gt
+import incident_builder as ib
+import run_corpus as rc
+
+PASS, FAIL = "PASS", "FAIL"
+results: list[tuple[str, str, str]] = []
+
+
+def check(name, condition, detail=""):
+    results.append((name, PASS if condition else FAIL, "" if condition else detail))
+
+
+def run() -> int:
+    T0 = datetime(2026, 9, 4, 12, 0, tzinfo=timezone.utc)
+    PRE, POST, D = ib.PRE_MINUTES, ib.POST_MINUTES, 25
+
+    # ---- the gaps are the builder's, not a second set of numbers ----
+    plan = [("F3", "db"), ("F1", "web")]
+    rows = rc.schedule(plan, D, start=T0)
+    gap = (rows[1][2] - rows[0][3]).total_seconds() / 60
+    check("after a fault the next window waits the full lead-in",
+          gap == PRE, "waited %s, PRE is %s" % (gap, PRE))
+
+    plan = [("F0", "web"), ("F3", "db")]
+    rows = rc.schedule(plan, D, start=T0)
+    gap = (rows[1][2] - rows[0][3]).total_seconds() / 60
+    check("after a control it waits only the tail", gap == POST,
+          "waited %s, POST is %s" % (gap, POST))
+    check("and the tail really is the cheaper one", POST < PRE)
+
+    # ---- the schedule must satisfy the guard that will judge it -------------
+    # The real check: feed the planned windows to open_incident itself. If the
+    # sequencer and the guard ever disagree, the sequencer is the one that is
+    # wrong, and this is where it shows.
+    import tempfile
+    from pathlib import Path
+
+    log = Path(tempfile.mkdtemp()) / "gt.jsonl"
+    rows = rc.schedule(rc.DEFAULT_PLAN, D, start=T0)
+    accepted, refusal = 0, ""
+    for index, (fault, node, opens, closes, _wait) in enumerate(rows):
+        try:
+            gt.open_incident(
+                incident_id="PLAN-%d" % index, fault=fault, instance_id="i-0x",
+                window_start=opens, window_end_planned=closes,
+                operator="selftest", path=log,
+                context_pre_minutes=PRE, context_post_minutes=POST)
+            accepted += 1
+        except gt.GroundTruthError as exc:
+            refusal = str(exc)
+            break
+    check("every window the sequencer plans is accepted by the guard",
+          accepted == len(rows), "accepted %d of %d: %s" % (accepted, len(rows), refusal))
+
+    # NEGATIVE: shrink one gap by a minute and the guard must refuse it. Without
+    # this the check above could pass because the guard is asleep.
+    log = Path(tempfile.mkdtemp()) / "gt.jsonl"
+    tight = rc.schedule([("F3", "db"), ("F1", "web")], D, start=T0)
+    gt.open_incident(incident_id="T0", fault="F3", instance_id="i-0x",
+                     window_start=tight[0][2], window_end_planned=tight[0][3],
+                     operator="selftest", path=log,
+                     context_pre_minutes=PRE, context_post_minutes=POST)
+    try:
+        gt.open_incident(
+            incident_id="T1", fault="F1", instance_id="i-0x",
+            window_start=tight[1][2] - timedelta(minutes=1),
+            window_end_planned=tight[1][3] - timedelta(minutes=1),
+            operator="selftest", path=log,
+            context_pre_minutes=PRE, context_post_minutes=POST)
+        check("RED: one minute tighter and the guard refuses", False,
+              "the guard accepted a gap the sequencer would not have planned")
+    except gt.GroundTruthError:
+        check("RED: one minute tighter and the guard refuses", True)
+
+    # ---- a failure stops the sequence --------------------------------------
+    calls = []
+
+    def failing_runner(fault, node, duration, dry_run):
+        calls.append((fault, node))
+        return 0 if len(calls) < 2 else 1        # the second one fails
+
+    completed = rc.run([("F3", "db"), ("F1", "web"), ("F0", "web")], D,
+                       sleeper=lambda _s: None, runner=failing_runner)
+    check("a failed injection stops the sequence", completed == 1,
+          "completed=%d" % completed)
+    check("and nothing after it is attempted", len(calls) == 2,
+          "it attempted %d injections: %s" % (len(calls), calls))
+
+    ok_calls = []
+
+    def good_runner(fault, node, duration, dry_run):
+        ok_calls.append((fault, node))
+        return 0
+
+    completed = rc.run(rc.DEFAULT_PLAN, D, sleeper=lambda _s: None, runner=good_runner)
+    check("a clean run completes every injection in order",
+          completed == len(rc.DEFAULT_PLAN) and ok_calls == rc.DEFAULT_PLAN,
+          str(ok_calls))
+
+    # ---- the pre-flight has to know before it starts, not at step three ----
+    class FakeEC2:
+        def __init__(self, states):
+            self.states = states
+
+        def describe_instances(self, Filters=None, InstanceIds=None, **kw):
+            if InstanceIds:
+                return {"Reservations": [{"Instances": [
+                    {"InstanceId": InstanceIds[0], "InstanceType": "t3.micro"}]}]}
+            out = []
+            for role, state in self.states.items():
+                tags = [{"Key": "Pilot", "Value": "IA-45"},
+                        {"Key": "ChainRole", "Value": role}]
+                upstream = {"app": "db", "web": "app"}.get(role)
+                if upstream:
+                    tags.append({"Key": "DependsOn", "Value": upstream})
+                out.append({"InstanceId": "i-0" + role, "State": {"Name": state},
+                            "PrivateIpAddress": "10.0.0.1", "Tags": tags})
+            return {"Reservations": [{"Instances": out}]}
+
+    class FakeCW:
+        def __init__(self, balance):
+            self.balance = balance
+
+        def get_metric_statistics(self, **kw):
+            if self.balance is None:
+                return {"Datapoints": []}
+            return {"Datapoints": [{"Timestamp": T0, "Average": self.balance}]}
+
+    all_up = {"db": "running", "app": "running", "web": "running"}
+
+    reasons = rc.preflight(rc.DEFAULT_PLAN, D,
+                           ec2=FakeEC2({**all_up, "web": "stopped"}),
+                           cloudwatch=FakeCW(200))
+    check("a chain that is not running is caught before the first injection",
+          len(reasons) == 1 and "chain is not running" in reasons[0], str(reasons))
+
+    reasons = rc.preflight(rc.DEFAULT_PLAN, D,
+                           ec2=FakeEC2(all_up), cloudwatch=FakeCW(200))
+    check("a healthy chain with credits to spare starts", reasons == [], str(reasons))
+
+    # The case that justifies the whole function: enough credits for the CPU
+    # fault, checked BEFORE four hours of waiting rather than when it is reached.
+    reasons = rc.preflight(rc.DEFAULT_PLAN, D,
+                           ec2=FakeEC2(all_up), cloudwatch=FakeCW(5))
+    check("a CPU fault that cannot afford its window is refused up front",
+          len(reasons) == 1 and "needs" in reasons[0], str(reasons))
+    check("and the refusal names the projected balance, not just the current one",
+          "projected" in reasons[0], reasons[0] if reasons else "")
+
+    reasons = rc.preflight(rc.DEFAULT_PLAN, D,
+                           ec2=FakeEC2(all_up), cloudwatch=FakeCW(None))
+    check("no credit datapoint at all is refused, not assumed sufficient",
+          len(reasons) == 1 and "no CPUCreditBalance" in reasons[0], str(reasons))
+
+    # A plan with no CPU fault needs no balance at all.
+    reasons = rc.preflight([("F3", "db"), ("F0", "web")], D,
+                           ec2=FakeEC2(all_up), cloudwatch=FakeCW(None))
+    check("a plan with no CPU fault does not ask about credits", reasons == [],
+          str(reasons))
+
+    # ---- the plan itself has to be worth running ---------------------------
+    # Two clean F3s survive from the first corpus (IA-61). The plan must add
+    # what they lack, or 4.2 hours buys another set of stop faults.
+    planned_classes = {fault for fault, _node in rc.DEFAULT_PLAN}
+    check("the plan introduces fault classes the surviving corpus lacks",
+          {"F1", "F0"} <= planned_classes, str(planned_classes))
+    planned_nodes = {node for _fault, node in rc.DEFAULT_PLAN}
+    check("and covers more than one cause node", len(planned_nodes) >= 2,
+          str(planned_nodes))
+
+    width = max(len(n) for n, _, _ in results)
+    failed = 0
+    for name, status, detail in results:
+        print(f"{status:4}  {name:<{width}}  {detail}")
+        failed += status == FAIL
+    print(f"\n{len(results) - failed}/{len(results)} checks passed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(run())
