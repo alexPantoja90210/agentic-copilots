@@ -136,13 +136,31 @@ def run() -> int:
             return {"Reservations": [{"Instances": out}]}
 
     class FakeCW:
-        def __init__(self, balance):
+        """
+        CPUCreditBalance at a fixed value, and NetworkIn as a run of datapoints
+        going back `history_minutes` from now. `history_gap_at` punches a hole
+        that many minutes back, so the unbroken-run logic can be exercised.
+        """
+
+        def __init__(self, balance, history_minutes=600, history_gap_at=None):
             self.balance = balance
+            self.history_minutes = history_minutes
+            self.history_gap_at = history_gap_at
 
         def get_metric_statistics(self, **kw):
-            if self.balance is None:
-                return {"Datapoints": []}
-            return {"Datapoints": [{"Timestamp": T0, "Average": self.balance}]}
+            if kw["MetricName"] == "CPUCreditBalance":
+                if self.balance is None:
+                    return {"Datapoints": []}
+                return {"Datapoints": [{"Timestamp": T0, "Average": self.balance}]}
+            now = datetime.now(timezone.utc)
+            points = []
+            step = 5
+            for minutes_ago in range(0, self.history_minutes + 1, step):
+                if self.history_gap_at and minutes_ago == self.history_gap_at:
+                    continue
+                points.append({"Timestamp": now - timedelta(minutes=minutes_ago),
+                               "Average": 3100.0})
+            return {"Datapoints": points}
 
     all_up = {"db": "running", "app": "running", "web": "running"}
 
@@ -170,11 +188,67 @@ def run() -> int:
     check("no credit datapoint at all is refused, not assumed sufficient",
           len(reasons) == 1 and "no CPUCreditBalance" in reasons[0], str(reasons))
 
+    # ---- the first window's lead-in has to contain data --------------------
+    # The check that was missed by hand: a plan about to open its CPU fault
+    # fifteen minutes after boot would have spent four hours producing one
+    # incident whose baseline was a 60-minute absence.
+    reasons = rc.preflight(rc.DEFAULT_PLAN, D, ec2=FakeEC2(all_up),
+                           cloudwatch=FakeCW(200, history_minutes=15))
+    check("a chain with only minutes of history is refused",
+          any("lead-in" in r for r in reasons), str(reasons))
+    check("and the refusal says when the lead-in becomes available",
+          any("is not available until" in r for r in reasons), str(reasons))
+
+    reasons = rc.preflight(rc.DEFAULT_PLAN, D, ec2=FakeEC2(all_up),
+                           cloudwatch=FakeCW(200, history_minutes=600))
+    check("hours of continuous history is accepted", reasons == [], str(reasons))
+
+    # A hole 20 minutes back means the unbroken run is only 20 minutes long,
+    # however much older data sits behind it. An instance that ran yesterday,
+    # was stopped, and started again has exactly this shape.
+    reasons = rc.preflight(rc.DEFAULT_PLAN, D, ec2=FakeEC2(all_up),
+                           cloudwatch=FakeCW(200, history_minutes=600,
+                                             history_gap_at=20))
+    check("old data behind a gap does not count as history",
+          any("lead-in" in r for r in reasons),
+          "a stopped-and-restarted instance has old datapoints and no baseline")
+
     # A plan with no CPU fault needs no balance at all.
     reasons = rc.preflight([("F3", "db"), ("F0", "web")], D,
                            ec2=FakeEC2(all_up), cloudwatch=FakeCW(None))
     check("a plan with no CPU fault does not ask about credits", reasons == [],
           str(reasons))
+
+    # ---- one clock, in a module that prints times next to each other -------
+    # The first live refusal read "continuous data only since 13:28 ... the
+    # first window opens at 19:38" -- correct arithmetic, six hours of
+    # incoherence, because boto3 returns the machine's zone and the schedule is
+    # built in UTC. Same defect as IA-59, new file.
+    from datetime import timezone as _tz, timedelta as _td
+    minus_six = _tz(_td(hours=-6))
+    check("a timestamp in another zone renders as UTC",
+          rc._utc(T0.astimezone(minus_six)) == rc._utc(T0) == "12:00",
+          "%s vs %s" % (rc._utc(T0.astimezone(minus_six)), rc._utc(T0)))
+
+    class LocalCW(FakeCW):
+        """CloudWatch as boto3 actually returns it here: not in UTC."""
+
+        def get_metric_statistics(self, **kw):
+            got = FakeCW.get_metric_statistics(self, **kw)
+            for point in got["Datapoints"]:
+                point["Timestamp"] = point["Timestamp"].astimezone(minus_six)
+            return got
+
+    reasons = rc.preflight(rc.DEFAULT_PLAN, D, ec2=FakeEC2(all_up),
+                           cloudwatch=LocalCW(200, history_minutes=15))
+    check("a refusal built from non-UTC timestamps still speaks one clock",
+          reasons and all(":" in r for r in reasons)
+          and not any("13:" in r and "19:" in r for r in reasons),
+          str(reasons))
+    check("and the zone does not change the verdict",
+          bool(reasons) == bool(rc.preflight(rc.DEFAULT_PLAN, D,
+                                             ec2=FakeEC2(all_up),
+                                             cloudwatch=FakeCW(200, history_minutes=15))))
 
     # ---- the plan itself has to be worth running ---------------------------
     # Two clean F3s survive from the first corpus (IA-61). The plan must add

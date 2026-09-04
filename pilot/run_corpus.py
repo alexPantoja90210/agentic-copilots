@@ -68,16 +68,58 @@ def schedule(plan, duration=DURATION_MINUTES, start=None):
     return out
 
 
+def _utc(moment) -> str:
+    """
+    HH:MM in UTC, always.
+
+    boto3 hands back timestamps in whatever zone the machine is set to. The
+    arithmetic is unaffected -- they carry an offset, so comparisons are right --
+    but printing one of those beside a UTC one produced a refusal that read
+    "data since 13:28, window opens at 19:38" and was six hours incoherent.
+    Third time this project has shipped two clocks in one sentence; this is the
+    conversion that stops it happening in this file.
+    """
+    return moment.astimezone(timezone.utc).strftime("%H:%M")
+
+
 def render(rows) -> str:
     lines = ["  #  fault  node   opens (UTC)   closes        waited before"]
     for index, (fault, node, opens, closes, wait) in enumerate(rows, 1):
         lines.append("  %d  %-5s  %-5s  %s         %s      %s"
-                     % (index, fault, node, opens.strftime("%H:%M"),
-                        closes.strftime("%H:%M"),
+                     % (index, fault, node, _utc(opens), _utc(closes),
                         "-" if not wait else "%d min" % wait))
     total = (rows[-1][3] - rows[0][2]).total_seconds() / 3600
     lines.append("\n  %d injections, %.1f hours end to end." % (len(rows), total))
     return "\n".join(lines)
+
+
+def data_since(cloudwatch, instance_id, now=None, lookback_minutes=240):
+    """
+    The start of the unbroken run of datapoints ending at the present.
+
+    Not "the oldest datapoint": an instance that ran yesterday, was stopped, and
+    started again has old datapoints and a hole. What a baseline needs is
+    CONTINUOUS history immediately before the window, so the run is walked back
+    from the newest datapoint and stops at the first gap.
+
+    Returns None when there are no datapoints at all.
+    """
+    now = now or datetime.now(timezone.utc)
+    got = cloudwatch.get_metric_statistics(
+        Namespace="AWS/EC2", MetricName="NetworkIn",
+        Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
+        StartTime=now - timedelta(minutes=lookback_minutes), EndTime=now,
+        Period=300, Statistics=["Average"])
+    points = sorted(got.get("Datapoints", []), key=lambda p: p["Timestamp"])
+    if not points:
+        return None
+    bucket = timedelta(seconds=300)
+    run_start = points[-1]["Timestamp"]
+    for earlier, later in zip(reversed(points[:-1]), reversed(points[1:])):
+        if later["Timestamp"] - earlier["Timestamp"] > bucket:
+            break
+        run_start = earlier["Timestamp"]
+    return run_start
 
 
 def preflight(plan, duration, ec2=None, cloudwatch=None) -> list[str]:
@@ -109,6 +151,33 @@ def preflight(plan, duration, ec2=None, cloudwatch=None) -> list[str]:
 
     rows = schedule(plan, duration)
     cloudwatch = cloudwatch or inject.session(None).client("cloudwatch")
+
+    # The lead-in of the FIRST window has to contain data. Everything after it
+    # is covered by the clearance between injections, but the first one opens
+    # against whatever history happens to exist -- and an instance started ten
+    # minutes ago has none. IA-53 is the same lesson from the other side: a
+    # young instance is not unhealthy, it is unobservable, and a prompt whose
+    # baseline is a 60-minute absence has no normal to be abnormal against.
+    #
+    # This check is here because it was missed by hand first: a plan was about
+    # to open its CPU fault fifteen minutes after boot, which would have spent
+    # four hours producing one incident with no baseline.
+    first_open = rows[0][2]
+    for role, node_info in sorted(nodes.items()):
+        since = data_since(cloudwatch, node_info["instance_id"])
+        if since is None:
+            reasons.append("%s has published no metrics yet. The first window's "
+                           "lead-in would be empty." % role)
+            continue
+        earliest = since + timedelta(minutes=ib.PRE_MINUTES)
+        if first_open < earliest:
+            reasons.append(
+                "%s has continuous data only since %s UTC, so a %d-minute "
+                "lead-in is not available until %s UTC -- the first window "
+                "opens at %s. Wait, or the first incident has no baseline."
+                % (role, _utc(since), ib.PRE_MINUTES,
+                   _utc(earliest), _utc(first_open)))
+
     for (fault, node, opens, _closes, _wait) in rows:
         if fault != "F1":
             continue
@@ -131,7 +200,7 @@ def preflight(plan, duration, ec2=None, cloudwatch=None) -> list[str]:
                 "%s on %s opens at %s UTC with about %.0f credits projected "
                 "(%.0f now, accruing %.0f/hour) and needs %.0f. Start the chain "
                 "earlier or shorten the window."
-                % (fault, node, opens.strftime("%H:%M"), projected, balance,
+                % (fault, node, _utc(opens), projected, balance,
                    earns_per_hour, needed))
     return reasons
 
@@ -151,7 +220,7 @@ def run(plan, duration, dry_run=False, sleeper=time.sleep, runner=None) -> int:
             print("\n  waiting %d min before %s on %s "
                   "(clearance after %s) -- resumes about %s UTC"
                   % (wait, fault, node, plan[index - 1][0],
-                     resume.strftime("%H:%M")), flush=True)
+                     _utc(resume)), flush=True)
             sleeper(wait * 60)
 
         print("\n=== %d/%d: %s on %s ===" % (index + 1, len(plan), fault, node),
