@@ -133,6 +133,122 @@ def assert_standard_credits(ec2, instance_id: str) -> str:
     return mode
 
 
+# Burstable credit economics, for the instance types this pilot actually uses.
+# An unknown type is REFUSED rather than guessed: guessing a drain rate is the
+# defect this table exists to prevent, and a wrong guess produces a wrong label.
+BURSTABLE = {
+    "t3.micro": {"vcpus": 2, "earn_per_hour": 12.0},
+    "t3.small": {"vcpus": 2, "earn_per_hour": 24.0},
+}
+
+# The balance an F1 window must still have left when it ends (IA-58).
+#
+# NOT a copy of a collector threshold. IA-51 deleted the constant 30 that used
+# to live in `collector.THRESHOLDS` as ("lt", 30.0, ...), because a level cannot
+# tell an exhausted instance from one too young to have accrued. Reserving 30
+# here would be a margin against a rule this project removed.
+#
+# And "the balance is falling" separates nothing: it falls during EVERY F1, at
+# 108 credits/hour under full load on a t3.micro. What separates F1 from F2 is
+# THROTTLING -- a balance that reaches the floor forces CPU back down to the
+# 10% baseline on its own, and the window stops being a CPU fault while the log
+# still says it is one.
+#
+# 10 is a judgement call, stated so it can be argued with: enough headroom that
+# five-minute publishing granularity, or a window that overruns a little,
+# cannot land on the floor.
+F1_END_BALANCE_FLOOR = 10.0
+
+
+def credit_cost(instance_type: str, minutes: float) -> float:
+    """
+    Credits a full-load window of this length consumes, net of what it earns.
+
+    Computed from the window and the vCPU count rather than fixed, because a
+    25-minute window and a 10-minute one do not need the same balance and a
+    constant would be wrong for one of them.
+    """
+    spec = BURSTABLE.get(instance_type)
+    if spec is None:
+        raise InjectionError(
+            "%s is not in the burstable table, so the credit drain of a CPU "
+            "fault against it is unknown. Add it with its vCPU count and earn "
+            "rate, or run the fault elsewhere. Guessing the rate is how an F1 "
+            "becomes an F2 wearing an F1 label." % instance_type)
+    # 100%% of one vCPU costs one credit per minute, by definition.
+    drain_per_minute = spec["vcpus"] - spec["earn_per_hour"] / 60.0
+    return drain_per_minute * minutes
+
+
+def latest_credit_balance(cloudwatch, instance_id: str, now=None):
+    """
+    The most recent CPUCreditBalance datapoint, as (value, observed_at).
+
+    Published every five minutes, so this can be up to five minutes stale. On an
+    idle instance the balance only RISES in that gap, which makes a stale
+    reading conservative in the safe direction: it can refuse a window that
+    would have been fine, never permit one that would not.
+    """
+    now = now or datetime.now(timezone.utc)
+    got = cloudwatch.get_metric_statistics(
+        Namespace="AWS/EC2",
+        MetricName="CPUCreditBalance",
+        Dimensions=[{"Name": "InstanceId", "Value": instance_id}],
+        StartTime=now - timedelta(hours=1),
+        EndTime=now,
+        Period=300,
+        Statistics=["Average"],
+    )
+    points = sorted(got.get("Datapoints", []), key=lambda point: point["Timestamp"])
+    if not points:
+        return None, None
+    return points[-1]["Average"], points[-1]["Timestamp"]
+
+
+def assert_credit_headroom(cloudwatch, instance_id: str, instance_type: str,
+                           minutes: float, now=None) -> dict:
+    """
+    Refuse an F1 whose window would run the balance into throttling.
+
+    F2 is deliberately exempt and never reaches here: exhaustion is what F2 is
+    FOR, and applying this guard to it would refuse the fault for doing its job.
+    """
+    required = credit_cost(instance_type, minutes) + F1_END_BALANCE_FLOOR
+    balance, observed_at = latest_credit_balance(cloudwatch, instance_id, now=now)
+
+    if balance is None:
+        raise InjectionError(
+            "no CPUCreditBalance datapoint in the last hour for this instance. "
+            "The balance is unknown, and unknown is not the same as sufficient. "
+            "Wait for the instance to publish (5-minute granularity) and retry.")
+
+    if balance < required:
+        deficit = required - balance
+        earn_per_hour = BURSTABLE[instance_type]["earn_per_hour"]
+        wait_hours = deficit / earn_per_hour
+        raise InjectionError(
+            "credit balance %.0f is below the %.0f this %.0f-minute CPU fault "
+            "needs (%.0f consumed + %.0f left at the end, so the instance is "
+            "never throttled). Short by %.0f credits: about %.1f hour(s) of "
+            "idle accrual at %.0f/hour. Reading taken at %s.\n"
+            "Refusing, because a window that exhausts its credits stops being a "
+            "CPU fault part-way through -- the instance is throttled to its "
+            "baseline and CPU comes down on its own -- while the log would still "
+            "call it F1. A false label is worse than a missing incident."
+            % (balance, required, minutes, credit_cost(instance_type, minutes),
+               F1_END_BALANCE_FLOOR, deficit, wait_hours, earn_per_hour,
+               observed_at.isoformat() if observed_at else "unknown"))
+
+    return {"balance": balance, "required": required,
+            "observed_at": observed_at.isoformat() if observed_at else None,
+            "instance_type": instance_type}
+
+
+def instance_type_of(ec2, instance_id: str) -> str:
+    got = ec2.describe_instances(InstanceIds=[instance_id])
+    return got["Reservations"][0]["Instances"][0]["InstanceType"]
+
+
 RESTORE_ATTEMPTS = 3
 RESTORE_BACKOFF_S = (15, 45, 90)
 
@@ -422,9 +538,20 @@ def main(argv=None) -> int:
                 "Start the whole chain, let it settle, and try again."
                 % ", ".join(down))
 
+    credit_check = None
     if args.fault in ("F1", "F2"):
         mode = assert_standard_credits(ec2, instance_id)
         print(f"credit mode: {mode}")
+
+    # F1 only. F2 wants exhaustion; guarding it against exhaustion would refuse
+    # the fault for doing exactly what it exists to do.
+    if args.fault == "F1" and not args.dry_run:
+        credit_check = assert_credit_headroom(
+            sess.client("cloudwatch"), instance_id,
+            instance_type_of(ec2, instance_id), args.duration)
+        print("credit balance: %.0f (needs %.0f for %d minutes), read at %s"
+              % (credit_check["balance"], credit_check["required"],
+                 args.duration, credit_check["observed_at"]))
 
     window_start = datetime.now(timezone.utc)
     window_end_planned = window_start + timedelta(seconds=seconds)
@@ -456,6 +583,10 @@ def main(argv=None) -> int:
             # than re-derived later, because a label that depends on querying a
             # live account is a label with an expiry date.
             "topology": {r: n["depends_on"] for r, n in nodes.items()},
+            # What the balance was when the window opened. Evidence that this
+            # F1 had the headroom to stay an F1 -- checkable later against the
+            # metrics rather than taken on trust.
+            "credit_check": credit_check,
         },
     )
     print(f"label written: {incident_id} — {gt.FAULT_CLASSES[args.fault]} on {role}")

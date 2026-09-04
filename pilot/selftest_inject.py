@@ -290,6 +290,82 @@ def run() -> int:
           all(e["outcome"] == "api_error" and e["last_state"] == "stopped"
               for e in api_obs), str(api_obs[:1]))
 
+    # ---- IA-58: an F1 must not be allowed to become an F2 -----------------
+    # The worst bug this project can have is not a wrong answer, it is a wrong
+    # LABEL. If the balance runs out mid-window the instance is throttled, CPU
+    # comes back down on its own, and the log still says F1 while the metrics
+    # say F2. Nothing downstream can detect that: every component treats the
+    # label as axiomatic.
+
+    from datetime import datetime as _dt, timezone as _tz
+
+    class FakeCW:
+        """CPUCreditBalance at a fixed value, or no datapoints at all."""
+
+        def __init__(self, balance=None):
+            self.balance = balance
+
+        def get_metric_statistics(self, **kwargs):
+            if self.balance is None:
+                return {"Datapoints": []}
+            return {"Datapoints": [{"Timestamp": _dt(2026, 9, 3, 20, 25, tzinfo=_tz.utc),
+                                    "Average": self.balance}]}
+
+    # 25 minutes on a t3.micro: 25 * (2 - 0.2) = 45 consumed, + 10 floor = 55.
+    required = inject.credit_cost("t3.micro", 25) + inject.F1_END_BALANCE_FLOOR
+    check("the requirement is computed from the window, not fixed",
+          required == 55.0 and inject.credit_cost("t3.micro", 10) == 18.0,
+          "25min needs %s, 10min costs %s" % (required, inject.credit_cost("t3.micro", 10)))
+
+    ok_check = inject.assert_credit_headroom(FakeCW(120), "i-0test", "t3.micro", 25)
+    check("a comfortable balance proceeds, and reports what it measured",
+          ok_check["balance"] == 120 and ok_check["required"] == 55.0)
+
+    # The just-below case. This is the one a constant would wave through.
+    try:
+        inject.assert_credit_headroom(FakeCW(50), "i-0test", "t3.micro", 25)
+    except inject.InjectionError as exc:
+        message = str(exc)
+        check("a balance just below the requirement is refused", True)
+        check("and the refusal names the deficit and the wait",
+              "Short by 5 credits" in message and "hour(s) of idle accrual" in message,
+              message)
+    else:
+        check("a balance just below the requirement is refused", False,
+              "50 covers the 45 it will spend but leaves nothing at the end")
+
+    try:
+        inject.assert_credit_headroom(FakeCW(10), "i-0test", "t3.micro", 25)
+    except inject.InjectionError as exc:
+        check("a far-below balance is refused too", "Short by 45" in str(exc), str(exc))
+    else:
+        check("a far-below balance is refused too", False, "")
+
+    # RED: a check that only compares against the credits CONSUMED -- the
+    # obvious constant -- passes the 50 case, which is exactly the incident that
+    # would carry a false label. The margin is not decoration.
+    consumed_only = inject.credit_cost("t3.micro", 25)
+    check("RED: comparing against consumption alone would have allowed it",
+          50 >= consumed_only and 50 < required,
+          "consumed=%s required=%s" % (consumed_only, required))
+
+    try:
+        inject.assert_credit_headroom(FakeCW(None), "i-0test", "t3.micro", 25)
+    except inject.InjectionError as exc:
+        check("no datapoint means refuse: unknown is not the same as sufficient",
+              "unknown is not the same as sufficient" in str(exc), str(exc))
+    else:
+        check("no datapoint means refuse", False, "it proceeded on no evidence")
+
+    try:
+        inject.credit_cost("m5.large", 25)
+    except inject.InjectionError as exc:
+        check("an unknown instance type is refused, not guessed",
+              "not in the burstable table" in str(exc), str(exc))
+    else:
+        check("an unknown instance type is refused, not guessed", False,
+              "it guessed a drain rate")
+
     # ---- the pre-flight state check ----
     stopped = FakeEC2(start_failures=99, state="stopped")
     check("a target that cannot be started reports a non-running state",
