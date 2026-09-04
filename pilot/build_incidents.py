@@ -46,8 +46,11 @@ import incident_builder as ib
 # Identical for every incident, every fault class. See the module docstring.
 METRICS = ("CPUUtilization", "NetworkIn", "NetworkOut", "CPUCreditBalance")
 
-PRE_MINUTES = 60
-POST_MINUTES = 30
+# Defined in incident_builder so the injector can read them without importing
+# this module. See IA-61: the guard that protects the prompt must use the same
+# numbers the prompt is built with.
+PRE_MINUTES = ib.PRE_MINUTES
+POST_MINUTES = ib.POST_MINUTES
 PERIOD_SECONDS = 300          # EC2 basic monitoring. Asking for 60 returns less.
 
 DEFAULT_OUT = Path(r"C:\dev\ia-pilot\incidents.jsonl")
@@ -108,6 +111,41 @@ def fetch_metrics(client, entry: dict, nodes: dict) -> dict:
     return metrics
 
 
+def contaminants(entry: dict, entries: list[dict]) -> list[dict]:
+    """
+    Other incidents' faults that fall inside this one's padded range.
+
+    IA-61: the injector now refuses to create these, but the six incidents built
+    on 3 and 4 Sep already exist and no code can repair them. What can be done
+    is refuse to let them look clean -- the contamination travels with the built
+    incident and the scorer can see it.
+
+    A neighbour's ACTUAL end is used where it is known: a restore that failed
+    ran longer than its planned window, and the metrics show the real outage,
+    not the intended one.
+    """
+    mine_lo = datetime.fromisoformat(entry["window_start"]) - timedelta(minutes=PRE_MINUTES)
+    mine_hi = datetime.fromisoformat(entry["window_end_planned"]) + timedelta(minutes=POST_MINUTES)
+
+    closes = {e["incident_id"]: e for e in entries if e.get("record") == "close"}
+    found = []
+    for other in entries:
+        if other.get("record") != "open" or other["incident_id"] == entry["incident_id"]:
+            continue
+        if other.get("dry_run"):
+            continue
+        start = datetime.fromisoformat(other["window_start"])
+        closed = closes.get(other["incident_id"], {})
+        end = datetime.fromisoformat(
+            closed.get("window_end_actual") or other["window_end_planned"])
+        if start < mine_hi and end > mine_lo:
+            found.append({"incident_id": other["incident_id"],
+                          "fault": other["fault"],
+                          "node_role": other.get("node_role"),
+                          "window_start": other["window_start"]})
+    return found
+
+
 def build_all(entries, nodes, client) -> tuple[list[dict], list[dict]]:
     """Returns (built, skipped). A skip is always recorded with its reason."""
     built, skipped = [], []
@@ -139,6 +177,7 @@ def build_all(entries, nodes, client) -> tuple[list[dict], list[dict]]:
         # outage was ten minutes because the plan said so.
         incident["window_overran"] = bool(
             closed and closed.get("outcome") == "failed")
+        incident["contaminated_by"] = contaminants(opened, entries)
         built.append(incident)
     return built, skipped
 
@@ -179,10 +218,12 @@ def main(argv=None) -> int:
             handle.write(json.dumps(incident, ensure_ascii=False) + "\n")
 
     for incident in built:
-        print("built  %-28s %-3s cause=%-4s paged=%-4s usable=%s%s" % (
+        dirty = incident["contaminated_by"]
+        print("built  %-28s %-3s cause=%-4s paged=%-4s usable=%s%s%s" % (
             incident["incident_id"], incident["fault"], incident["fault_role"],
             incident["symptomatic_node"], incident["usable"],
-            "  WINDOW OVERRAN" if incident["window_overran"] else ""))
+            "  WINDOW OVERRAN" if incident["window_overran"] else "",
+            "  CONTAMINATED by %d" % len(dirty) if dirty else ""))
     for entry in skipped:
         print("skip   %-28s %s" % (entry["incident_id"], entry["reason"]),
               file=sys.stderr)
@@ -200,6 +241,19 @@ def main(argv=None) -> int:
     print("\n%d built, %d skipped -> %s" % (len(built), len(skipped), out))
     # A corpus of one fault class cannot distinguish reasoning from a rule of
     # thumb. Say so here rather than discovering it while reading the scores.
+    dirty = [i for i in built if i["contaminated_by"]]
+    if dirty:
+        print("\n!! %d of %d built incidents carry another incident's fault inside"
+              " the context their prompt shows (IA-61)." % (len(dirty), len(built)),
+              file=sys.stderr)
+        for incident in dirty:
+            print("!!   %s <- %s" % (incident["incident_id"], ", ".join(
+                "%s (%s on %s)" % (c["incident_id"], c["fault"], c["node_role"])
+                for c in incident["contaminated_by"])), file=sys.stderr)
+        print("!! The label names one cause and the prompt shows more than one"
+              " event. Scoring these mixes 'the context did not help' with"
+              " 'the context contained something else'.", file=sys.stderr)
+
     classes = {incident["fault"] for incident in built}
     roles = {incident["fault_role"] for incident in built}
     if len(classes) < 2 or len(roles) < 2:

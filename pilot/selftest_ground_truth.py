@@ -147,6 +147,83 @@ def run() -> int:
             "" if len(opens) == 2 else f"expected 2 open records, found {len(opens)}",
         ))
 
+    # ---- IA-61: the guard must protect the PROMPT, not only the window ----
+    # Five of the first six incidents this project built contained a
+    # neighbour's fault, because the plain overlap rule watches the interval the
+    # operator causes while the prompt is built from a 90-minute-wider one. The
+    # control was the worst case: its correct answer is "nothing happened" and
+    # its prompt held a real 20-minute outage.
+    import incident_builder as _ib
+    PRE, POST = _ib.PRE_MINUTES, _ib.POST_MINUTES
+    base = datetime(2026, 9, 4, 10, 0, tzinfo=timezone.utc)
+
+    def fresh_with_a(context=True):
+        """A log holding one 25-minute incident starting at `base`."""
+        log = Path(tempfile.mkdtemp()) / "gt.jsonl"
+        extra = dict(context_pre_minutes=PRE, context_post_minutes=POST) if context else {}
+        gt.open_incident(incident_id="A", fault="F3", instance_id="i-0x",
+                         window_start=base,
+                         window_end_planned=base + timedelta(minutes=25),
+                         operator="selftest", path=log, **extra)
+        return log
+
+    def place(log, start_at, context=True, name="B"):
+        extra = dict(context_pre_minutes=PRE, context_post_minutes=POST) if context else {}
+        return lambda: gt.open_incident(
+            incident_id=name, fault="F3", instance_id="i-0x",
+            window_start=start_at,
+            window_end_planned=start_at + timedelta(minutes=25),
+            operator="selftest", path=log, **extra)
+
+    expect_ok("a window separated by the full lead-in is allowed",
+              place(fresh_with_a(), base + timedelta(minutes=25 + PRE)))
+
+    expect_raises("one minute short of the lead-in is refused",
+                  place(fresh_with_a(), base + timedelta(minutes=25 + PRE - 1)),
+                  "Earliest window this may open")
+
+    # RED: overlapping ONLY in the padding -- the exact shape of the six
+    # incidents built on 3 and 4 Sep. The windows do not touch, so the plain
+    # overlap rule allows it. That is the defect, reproduced.
+    padding_only = base + timedelta(minutes=26)      # one minute after A ends
+    expect_raises("RED: a padding-only overlap is refused",
+                  place(fresh_with_a(), padding_only),
+                  "does not overlap another incident")
+
+    # ...and the proof it is the new rule doing the work: the same two windows,
+    # with no context declared, are still accepted. If this ever starts failing,
+    # the check above has stopped being specific to the padding.
+    expect_ok("RED confirmed: with no context declared, the same pair passes",
+              place(fresh_with_a(context=False), padding_only, context=False))
+
+    # The other direction: a window landing inside an EARLIER incident's tail.
+    # It matters on its own, because that prompt was written first and cannot be
+    # repaired afterwards.
+    late = Path(tempfile.mkdtemp()) / "gt.jsonl"
+    gt.open_incident(incident_id="A", fault="F3", instance_id="i-0x",
+                     window_start=base + timedelta(minutes=200),
+                     window_end_planned=base + timedelta(minutes=225),
+                     operator="selftest", path=late,
+                     context_pre_minutes=PRE, context_post_minutes=POST)
+    # The fixture has to be honest about what it is testing: B must sit inside
+    # A's lead-in WITHOUT touching A's window, or the plain overlap rule fires
+    # and this test passes while proving nothing. (It did exactly that on the
+    # first attempt.)
+    b_start = base + timedelta(minutes=170)
+    b_end = b_start + timedelta(minutes=25)
+    a_start = base + timedelta(minutes=200)
+    results.append((
+        "the fixture for the context test does NOT plainly overlap",
+        PASS if b_end <= a_start else FAIL,
+        "" if b_end <= a_start else "B ends %s, A starts %s" % (b_end, a_start)))
+    results.append((
+        "and it does sit inside the earlier incident's lead-in",
+        PASS if b_end > a_start - timedelta(minutes=PRE) else FAIL, ""))
+
+    expect_raises("a window inside an earlier incident's context is refused",
+                  place(late, b_start),
+                  "context window")
+
     width = max(len(n) for n, _, _ in results)
     failed = 0
     for name, status, detail in results:

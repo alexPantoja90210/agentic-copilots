@@ -93,6 +93,20 @@ def symptomatic_node(fault_role: str, nodes: dict) -> str:
 
 BUCKET_SECONDS = 300
 
+# How much context a built prompt carries either side of the fault window.
+#
+# They live HERE, not in build_incidents, because two things need them and a
+# cycle would form if the injector imported the builder: the builder pads the
+# query, and the injector must refuse a window whose padded range would contain
+# a neighbour's fault (IA-61). Stating the same number in two files is how the
+# two drift, and this pair has to agree exactly or the guard protects the wrong
+# interval.
+#
+# PRE is the larger because a series that begins at the fault has no baseline to
+# be abnormal against; POST only has to show the recovery.
+PRE_MINUTES = 60
+POST_MINUTES = 30
+
 
 def _spans(stamp, moment):
     """Does the 5-minute bucket starting at `stamp` contain `moment`?"""

@@ -183,6 +183,56 @@ def run() -> int:
         check("without the exemption the metric names alone trip the detector",
               False, "it built -- so the exemption is not what made the F1 case pass")
 
+    # ---- IA-61: contamination travels with the built incident -------------
+    # The injector now refuses to create these, but six already exist and no
+    # code can repair them. What can be done is refuse to let them look clean.
+    near = [opened("F3-db-N", "F3", "db",
+                   start="2026-09-04T02:00:00+00:00", end="2026-09-04T02:25:00+00:00"),
+            closed("F3-db-N"),
+            opened("F0-web-N", "F0", "web",           # one minute later: the
+                   start="2026-09-04T02:26:00+00:00", # exact shape of 4 Sep
+                   end="2026-09-04T02:51:00+00:00"),
+            closed("F0-web-N")]
+    built_near, _ = bi.build_all(near, nodes, FakeCloudWatch())
+    near_by_id = {i["incident_id"]: i for i in built_near}
+
+    check("a neighbour inside the padded range is recorded",
+          [c["incident_id"] for c in near_by_id["F0-web-N"]["contaminated_by"]] == ["F3-db-N"],
+          str(near_by_id["F0-web-N"]["contaminated_by"]))
+    check("and the record says which fault and which node it was",
+          near_by_id["F0-web-N"]["contaminated_by"][0]["fault"] == "F3"
+          and near_by_id["F0-web-N"]["contaminated_by"][0]["node_role"] == "db")
+    check("the contamination is mutual, so both incidents carry it",
+          len(near_by_id["F3-db-N"]["contaminated_by"]) == 1)
+
+    far = [opened("F3-db-F", "F3", "db",
+                  start="2026-09-04T02:00:00+00:00", end="2026-09-04T02:25:00+00:00"),
+           closed("F3-db-F"),
+           opened("F0-web-F", "F0", "web",            # PRE minutes after the end
+                  start="2026-09-04T03:25:00+00:00",
+                  end="2026-09-04T03:50:00+00:00"),
+           closed("F0-web-F")]
+    built_far, _ = bi.build_all(far, nodes, FakeCloudWatch())
+    check("a properly separated pair is recorded as clean",
+          all(i["contaminated_by"] == [] for i in built_far),
+          str([(i["incident_id"], i["contaminated_by"]) for i in built_far]))
+
+    # A failed restore ran LONGER than planned, so the real outage is what has
+    # to be checked against the neighbour -- not the window we intended.
+    overran = [opened("F3-db-O", "F3", "db",
+                      start="2026-09-04T02:00:00+00:00", end="2026-09-04T02:25:00+00:00"),
+               {"record": "close", "incident_id": "F3-db-O", "outcome": "failed",
+                "window_end_actual": "2026-09-04T03:30:00+00:00"},
+               opened("F0-web-O", "F0", "web",
+                      start="2026-09-04T03:25:00+00:00",
+                      end="2026-09-04T03:50:00+00:00"),
+               closed("F0-web-O")]
+    built_over, _ = bi.build_all(overran, nodes, FakeCloudWatch())
+    over_by_id = {i["incident_id"]: i for i in built_over}
+    check("an overrunning neighbour is caught by its ACTUAL end, not its planned one",
+          len(over_by_id["F0-web-O"]["contaminated_by"]) == 1,
+          "planned separation was clean; the outage actually ran into it")
+
     # ---- what must be skipped, and said out loud --------------------------
     _, skipped = bi.build_all(
         [opened("DRY-1", "F3", "db", dry_run=True), closed("DRY-1")], nodes,

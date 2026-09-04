@@ -30,6 +30,7 @@ from datetime import datetime, timedelta, timezone
 
 import chain_topology as ct
 import ground_truth as gt
+import incident_builder as ib
 
 REGION = "us-east-1"
 PILOT_TAG_KEY = "Pilot"
@@ -588,6 +589,12 @@ def main(argv=None) -> int:
             # metrics rather than taken on trust.
             "credit_check": credit_check,
         },
+        # IA-61. The injector must refuse a window whose CONTEXT would contain
+        # a neighbour's fault, not only one whose window overlaps. The numbers
+        # come from incident_builder, which is what actually pads the query --
+        # restating them here would create a second source that drifts.
+        context_pre_minutes=ib.PRE_MINUTES,
+        context_post_minutes=ib.POST_MINUTES,
     )
     print(f"label written: {incident_id} — {gt.FAULT_CLASSES[args.fault]} on {role}")
 

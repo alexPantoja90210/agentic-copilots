@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 DEFAULT_LOG = Path(os.environ.get("IA_PILOT_LOG", r"C:\dev\ia-pilot\ground_truth.jsonl"))
@@ -125,6 +125,11 @@ def open_incident(
     path: Path = DEFAULT_LOG,
     dry_run: bool = False,
     details: dict | None = None,
+    # IA-61: how much context the built prompt will carry either side of
+    # this window. Zero means the caller is not building prompts from it
+    # and only the plain overlap rule applies.
+    context_pre_minutes: int = 0,
+    context_post_minutes: int = 0,
 ) -> dict:
     """
     Write the label. Called BEFORE the fault is induced — never after.
@@ -144,6 +149,9 @@ def open_incident(
     if any(e.get("incident_id") == incident_id for e in existing):
         raise GroundTruthError(f"Incident {incident_id} already exists in the log.")
 
+    pre = timedelta(minutes=context_pre_minutes)
+    post = timedelta(minutes=context_post_minutes)
+    conflicts = []
     for start, end, other in _windows(existing):
         if window_start < end and start < window_end_planned:
             raise GroundTruthError(
@@ -151,6 +159,38 @@ def open_incident(
                 f"incident {other} [{_utc(start)} .. {_utc(end)}]. Two faults in one "
                 "window produce a label that is a guess about which one the model saw."
             )
+
+        # IA-61. The check above protects the interval the OPERATOR causes. The
+        # prompt is built from a wider interval -- the window plus the context
+        # either side -- and a neighbour's fault landing in that padding is
+        # visible to the agent while the label says nothing about it.
+        #
+        # Both directions matter. A neighbour inside my padding contaminates my
+        # prompt; my window inside a neighbour's padding contaminates theirs,
+        # and theirs was written first and cannot be fixed afterwards.
+        if start < window_end_planned + post and window_start - pre < end:
+            conflicts.append((other, start, end, "their fault sits in my context window"))
+        elif window_start < end + post and start - pre < window_end_planned:
+            conflicts.append((other, start, end, "my fault sits in their context window"))
+
+    if conflicts:
+        clearance = max(pre, post)
+        earliest = max(end for _o, _s, end, _w in conflicts) + clearance
+        detail = "; ".join(
+            "%s [%s .. %s] -- %s" % (o, _utc(s_), _utc(e), why)
+            for o, s_, e, why in conflicts)
+        raise GroundTruthError(
+            f"Window [{_utc(window_start)} .. {_utc(window_end_planned)}] does not "
+            f"overlap another incident, but its {context_pre_minutes}-minute lead-in "
+            f"and {context_post_minutes}-minute tail do: {detail}.\n"
+            f"The prompt an agent reads is the window PLUS that context, so a "
+            f"neighbouring fault inside it is evidence the label does not account "
+            f"for -- and the control, whose correct answer is that nothing "
+            f"happened, is the case it ruins first.\n"
+            f"Earliest window this may open: {_utc(earliest)} "
+            f"({clearance.total_seconds() / 60:.0f} minutes after the last "
+            f"conflicting window ends)."
+        )
 
     record = {
         "record": "open",
