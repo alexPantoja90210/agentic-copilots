@@ -113,27 +113,39 @@ def load_incidents(path: Path) -> list[dict]:
     return rows
 
 
-def refuse_unusable(incidents: list[dict]) -> list[str]:
+def refuse_unusable(selected: list[dict], corpus: list[dict] | None = None) -> list[str]:
     """
-    Reasons not to spend money on this corpus.
+    Reasons not to spend money, checked before the first call.
 
-    Checked before the first call, because discovering a contaminated corpus
-    after twelve API calls costs the calls and teaches nothing new -- the file
-    already said so.
+    Two kinds of reason, and they are judged against two different things --
+    which is the whole point of the second argument.
+
+    **Per incident**, against what will actually be asked: a contaminated
+    prompt, or a window with no usable datapoints. Those are properties of the
+    incidents being sent.
+
+    **Per corpus**, against the whole file: whether the fault classes and cause
+    nodes vary enough that a fixed rule could not score as well as reasoning.
+    That is a property of the CORPUS, not of any subset of it. Judging it on the
+    slice made `--limit 1` refuse itself -- one incident has one class and one
+    node by definition -- and the obvious way out would have been
+    `--allow-unusable`, which also switches off the contamination check. A guard
+    that pushes the operator into disabling a different guard is a bad guard.
     """
+    corpus = corpus if corpus is not None else selected
     reasons = []
-    dirty = [i["incident_id"] for i in incidents if i.get("contaminated_by")]
+    dirty = [i["incident_id"] for i in selected if i.get("contaminated_by")]
     if dirty:
         reasons.append(
             "%d incident(s) carry another incident's fault inside the context "
             "their prompt shows (IA-61): %s. Scoring these mixes 'the context "
             "did not help' with 'the context contained something else'."
             % (len(dirty), ", ".join(dirty)))
-    unusable = [i["incident_id"] for i in incidents if not i.get("usable")]
+    unusable = [i["incident_id"] for i in selected if not i.get("usable")]
     if unusable:
         reasons.append("no usable metric datapoints: %s" % ", ".join(unusable))
-    classes = {i["fault"] for i in incidents}
-    roles = {i["fault_role"] for i in incidents}
+    classes = {i["fault"] for i in corpus}
+    roles = {i["fault_role"] for i in corpus}
     if len(classes) < 2 or len(roles) < 2:
         reasons.append(
             "the corpus has %d fault class(es) and %d cause node(s). An agent "
@@ -297,9 +309,12 @@ def main(argv=None) -> int:
                          "choice recorded in the run directory.")
     args = ap.parse_args(argv)
 
-    incidents = load_incidents(Path(args.incidents))
+    corpus = load_incidents(Path(args.incidents))
+    incidents = corpus[:args.limit] if args.limit else corpus
     if args.limit:
-        incidents = incidents[:args.limit]
+        print("--limit %d: asking %d of %d incidents. The corpus-level checks "
+              "still judge all %d."
+              % (args.limit, len(incidents), len(corpus), len(corpus)))
 
     print("%d incident(s) x %d arms = %d calls, model %s\n  sampling: %s"
           % (len(incidents), len(ARMS), len(incidents) * len(ARMS), MODEL, SAMPLING))
@@ -309,7 +324,7 @@ def main(argv=None) -> int:
                  len(incident["arm_a"]), len(incident["arm_b"]),
                  "   CONTAMINATED" if incident.get("contaminated_by") else ""))
 
-    reasons = refuse_unusable(incidents)
+    reasons = refuse_unusable(incidents, corpus)
     if reasons:
         print("\nThis corpus does not support the comparison:", file=sys.stderr)
         for reason in reasons:

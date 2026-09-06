@@ -197,6 +197,11 @@ def main(argv=None) -> int:
     ap.add_argument("--show", metavar="INCIDENT_ID",
                     help="print both arms for one incident, for eyeballing")
     ap.add_argument("--region", default="us-east-1")
+    ap.add_argument("--clean", action="store_true",
+                    help="write only the incidents whose prompt shows no other "
+                         "incident's fault. The full record still goes to --out; "
+                         "this selects the subset that can be compared, and "
+                         "prints exactly what it left out and why.")
     args = ap.parse_args(argv)
 
     entries = gt.read_all(Path(args.log))
@@ -219,8 +224,21 @@ def main(argv=None) -> int:
     out = Path(args.out)
     gt.check_location(out)          # never inside a repo, never under OneDrive
     out.parent.mkdir(parents=True, exist_ok=True)
+
+    # The selection is a separate step from the building, and it is loud.
+    # Filtering silently inside the writer would mean the corpus that ran and
+    # the corpus that was recorded could differ without anyone noticing.
+    selected = built
+    if args.clean:
+        selected = [i for i in built if not i["contaminated_by"]]
+        dropped = [i for i in built if i["contaminated_by"]]
+        print("--clean: writing %d of %d built incidents." % (len(selected), len(built)))
+        for incident in dropped:
+            print("  excluded  %-28s <- %s" % (incident["incident_id"], ", ".join(
+                c["incident_id"] for c in incident["contaminated_by"])))
+
     with out.open("w", encoding="utf-8") as handle:
-        for incident in built:
+        for incident in selected:
             handle.write(json.dumps(incident, ensure_ascii=False) + "\n")
 
     for incident in built:
@@ -244,7 +262,8 @@ def main(argv=None) -> int:
             print("no built incident with id %s" % args.show, file=sys.stderr)
             return 1
 
-    print("\n%d built, %d skipped -> %s" % (len(built), len(skipped), out))
+    print("\n%d built, %d skipped, %d written -> %s"
+          % (len(built), len(skipped), len(selected), out))
     # A corpus of one fault class cannot distinguish reasoning from a rule of
     # thumb. Say so here rather than discovering it while reading the scores.
     dirty = [i for i in built if i["contaminated_by"]]
@@ -260,8 +279,8 @@ def main(argv=None) -> int:
               " event. Scoring these mixes 'the context did not help' with"
               " 'the context contained something else'.", file=sys.stderr)
 
-    classes = {incident["fault"] for incident in built}
-    roles = {incident["fault_role"] for incident in built}
+    classes = {incident["fault"] for incident in selected}
+    roles = {incident["fault_role"] for incident in selected}
     if len(classes) < 2 or len(roles) < 2:
         print("\n!! This corpus has %d fault class(es) and %d cause node(s)."
               % (len(classes), len(roles)), file=sys.stderr)

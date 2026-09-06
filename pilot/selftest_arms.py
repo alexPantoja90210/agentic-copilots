@@ -250,6 +250,23 @@ def run() -> int:
     check("a varied, clean corpus is accepted", ra.refuse_unusable(varied) == [],
           str(ra.refuse_unusable(varied)))
 
+    # A slice of a varied corpus is judged on the corpus, not on the slice.
+    # Checking diversity on the slice made --limit 1 refuse itself, and the
+    # obvious escape (--allow-unusable) would also have switched off the
+    # contamination check.
+    one = [varied[0]]
+    check("a single-incident slice of a varied corpus is allowed",
+          ra.refuse_unusable(one, varied) == [], str(ra.refuse_unusable(one, varied)))
+    check("but that same incident alone as the whole corpus is refused",
+          any("fixed rule" in r for r in ra.refuse_unusable(one)),
+          "diversity is a property of the corpus; nothing else changed")
+    dirty_slice = [incident("D", "F3", "db",
+                            contaminated=[{"incident_id": "X", "fault": "F3",
+                                           "node_role": "app"}])]
+    check("a contaminated incident is still refused inside a varied corpus",
+          any("IA-61" in r for r in ra.refuse_unusable(dirty_slice, varied)),
+          "contamination is per incident and must survive the split")
+
     blind = [incident("A", "F3", "db"), incident("B", "F1", "web")]
     blind[0]["usable"] = False
     check("an incident with no usable datapoints is refused",
