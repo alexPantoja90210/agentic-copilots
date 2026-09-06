@@ -46,7 +46,34 @@ import ground_truth as gt
 
 MODEL = os.environ.get("PILOT_MODEL", "claude-sonnet-4-5")
 MAX_OUTPUT_TOKENS = 900
-TEMPERATURE = 0.0
+
+# Sampling is NOT controlled, and that is a finding rather than an omission.
+#
+# This runner was written to pass temperature=0 for reproducibility. The
+# installed SDK (anthropic 1.0.0) does not expose `temperature` on
+# messages.create at all -- the parameter list is max_tokens, messages, model,
+# cache_control, container, inference_geo, metadata, output_config,
+# service_tier, stop_sequences, stream, system, thinking, tool_choice, tools,
+# user_profile_id -- and `output_config` carries only `effort` and `format`.
+#
+# `extra_body` exists and temperature could be smuggled through it. It is
+# deliberately NOT done: a parameter the SDK no longer declares is a parameter
+# nobody can verify was applied, and the run record would then claim a
+# temperature the calls may not have used. An absent control that is declared
+# beats a present one that cannot be checked.
+#
+# What this costs, stated plainly: both arms get identical treatment, so the
+# comparison between them stands. What is lost is REPRODUCIBILITY -- running the
+# pilot twice may not produce the same answers, and every number is one sample
+# per arm rather than a mean. The write-up says so, and so does every record
+# this file writes.
+SAMPLING = "model default; temperature not exposed by anthropic 1.0.0"
+
+# Structured output (`output_config.format`) is available and is deliberately
+# unused. Forcing JSON would make extraction reliable, and would also change the
+# task: the paper's baseline answers in prose, and whether the model honours a
+# stated output contract is itself something worth measuring rather than
+# enforcing. `followed_contract` in each record is that measurement.
 
 # Identical for both arms. It states the output contract and nothing about the
 # fault catalogue: naming the possible faults would hand over the answer space,
@@ -122,7 +149,6 @@ def ask(client, prompt: str, budget) -> tuple[str, dict]:
     response = client.messages.create(
         model=MODEL,
         max_tokens=MAX_OUTPUT_TOKENS,
-        temperature=TEMPERATURE,
         system=SYSTEM,
         messages=[{"role": "user", "content": prompt}],
     )
@@ -162,7 +188,7 @@ def run(incidents, client, budget, out_dir: Path, verbose=True) -> list[dict]:
                 "incident_id": incident["incident_id"],
                 "arm": arm,
                 "model": MODEL,
-                "temperature": TEMPERATURE,
+                "sampling": SAMPLING,
                 "asked_at": datetime.now(timezone.utc).isoformat(),
                 "prompt": incident[arm],
                 "answer": text,
@@ -213,8 +239,8 @@ def main(argv=None) -> int:
     if args.limit:
         incidents = incidents[:args.limit]
 
-    print("%d incident(s) x %d arms = %d calls, model %s, temperature %s"
-          % (len(incidents), len(ARMS), len(incidents) * len(ARMS), MODEL, TEMPERATURE))
+    print("%d incident(s) x %d arms = %d calls, model %s\n  sampling: %s"
+          % (len(incidents), len(ARMS), len(incidents) * len(ARMS), MODEL, SAMPLING))
     for incident in incidents:
         print("  %-28s %-3s arm_a %5d chars   arm_b %6d chars%s"
               % (incident["incident_id"], incident["fault"],

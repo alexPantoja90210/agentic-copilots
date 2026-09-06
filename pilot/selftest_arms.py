@@ -99,9 +99,22 @@ def run() -> int:
 
     # ---- everything but the incident text is identical ----
     a_call, b_call = client.calls
-    for field in ("model", "system", "temperature", "max_tokens"):
+    for field in ("model", "system", "max_tokens"):
         check("the arms share the same %s" % field, a_call[field] == b_call[field],
               "%r vs %r" % (a_call[field], b_call[field]))
+    check("the two calls pass exactly the same set of parameters",
+          set(a_call) == set(b_call), "%s vs %s" % (sorted(a_call), sorted(b_call)))
+
+    # anthropic 1.0.0 does not accept temperature. Passing it would raise; and
+    # smuggling it through extra_body would put a value in the record that
+    # nobody could verify was applied. Neither happens, and a test says so
+    # rather than a comment.
+    check("no sampling parameter is passed that the SDK does not declare",
+          "temperature" not in a_call and "extra_body" not in a_call,
+          str(sorted(a_call)))
+    check("and the record says the sampling was not controlled",
+          records[0]["sampling"] == ra.SAMPLING and "not exposed" in ra.SAMPLING,
+          records[0].get("sampling"))
     check("and differ only in the message they carry",
           a_call["messages"][0]["content"] != b_call["messages"][0]["content"])
     check("arm A's text is inside arm B's, as IA-48 guarantees",
