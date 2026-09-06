@@ -92,13 +92,20 @@ def run() -> int:
           all(len(c["messages"]) == 1 and c["messages"][0]["role"] == "user"
               for c in client.calls),
           str([len(c["messages"]) for c in client.calls]))
-    first_answer = records[0]["answer"]
-    check("arm B's prompt does not contain arm A's answer",
-          first_answer not in client.calls[1]["messages"][0]["content"],
-          "arm B would be measuring memory, not context")
+    check("neither arm's prompt contains the other's answer",
+          all(other["answer"] not in call["messages"][0]["content"]
+              for other in records for call in client.calls),
+          "an arm that sees the other's answer measures memory, not context")
 
     # ---- everything but the incident text is identical ----
-    a_call, b_call = client.calls
+    # Which call is which arm is no longer decided by position: IA-49 asks for
+    # the order to be randomised, so it comes from the records. This check used
+    # to unpack client.calls positionally and broke the moment the shuffle
+    # landed the other way -- correctly, and worth keeping in mind: any test
+    # that assumes arm A goes first is now testing the shuffle by accident.
+    by_arm = {record["arm"]: index for index, record in enumerate(records)}
+    a_call = client.calls[by_arm["arm_a"]]
+    b_call = client.calls[by_arm["arm_b"]]
     for field in ("model", "system", "max_tokens"):
         check("the arms share the same %s" % field, a_call[field] == b_call[field],
               "%r vs %r" % (a_call[field], b_call[field]))
@@ -149,6 +156,83 @@ def run() -> int:
           "guessing what the model meant is the human scorer's job")
     check("the last ROOT CAUSE line wins, not the first mention",
           ra.claimed_cause("ROOT CAUSE: app\nOn reflection:\nROOT CAUSE: db") == "db")
+
+    # ---- IA-49 crit. 1: an answer is on disk the moment it arrives ----
+    # The first version built the whole list and wrote it after the loop. A
+    # failure on the ninth call would have thrown away eight answers already
+    # paid for, and criterion 1 says a missing transcript is a missing data
+    # point -- which it cannot be if the transcripts only live in memory.
+    class ExplodingClient(FakeClient):
+        def __init__(self, fail_on):
+            FakeClient.__init__(self)
+            self.fail_on = fail_on
+
+        class _Messages(FakeMessages):
+            pass
+
+    boom = FakeClient()
+    original_create = boom.messages.create
+
+    def create_then_fail(**kwargs):
+        if len(boom.calls) >= 3:
+            raise RuntimeError("the service went away")
+        return original_create(**kwargs)
+
+    boom.messages.create = create_then_fail
+    crash_dir = out / "crash"
+    b2 = ab.RunBudget(ra.MODEL, max_iterations=99, max_tokens=1_000_000)
+    try:
+        ra.run([incident("A"), incident("B")], boom, b2, crash_dir, verbose=False)
+    except RuntimeError:
+        pass
+    written = (crash_dir / "answers.jsonl").read_text(encoding="utf-8").strip()
+    check("answers written before the failure survive it",
+          len(written.splitlines()) == 3,
+          "%d line(s) on disk after a crash on the 4th call" % len(written.splitlines()))
+
+    # ---- IA-49: the arm asked first is randomised, per incident ----
+    orders = {ra.arm_order("INC-%02d" % i, seed=1) for i in range(30)}
+    check("the arm asked first is not always the same",
+          len(orders) == 2, str(orders))
+    check("the order for one incident is reproducible",
+          ra.arm_order("INC-07", 1) == ra.arm_order("INC-07", 1))
+    check("a different seed can give a different order",
+          {ra.arm_order("INC-%02d" % i, 1) for i in range(30)}
+          == {("arm_a", "arm_b"), ("arm_b", "arm_a")})
+    check("both arms are always asked, whatever the order",
+          all(set(o) == set(ra.ARMS) for o in orders))
+
+    # ---- IA-49 crit. 3: the two counters must agree ----
+    good = FakeClient()
+    b3 = ab.RunBudget(ra.MODEL, max_iterations=99, max_tokens=1_000_000)
+    recs = ra.run([incident("A")], good, b3, out / "rec", verbose=False)
+    check("a clean run reconciles", ra.reconcile(recs, b3) == [],
+          str(ra.reconcile(recs, b3)))
+    tampered = [dict(r) for r in recs]
+    tampered[0]["usage"] = dict(tampered[0]["usage"], input_tokens=1)
+    check("a mismatch between budget and transcripts is reported",
+          any("input_tokens" in p for p in ra.reconcile(tampered, b3)),
+          "two counters that disagree mean one is measuring something else")
+
+    # ---- IA-49 crit. 4: a truncated answer is marked, not scored ----
+    class TruncatingClient(FakeClient):
+        def __init__(self):
+            FakeClient.__init__(self)
+
+    trunc = FakeClient()
+    inner = trunc.messages.create
+
+    def create_truncated(**kwargs):
+        response = inner(**kwargs)
+        response.stop_reason = "max_tokens"
+        return response
+
+    trunc.messages.create = create_truncated
+    b4 = ab.RunBudget(ra.MODEL, max_iterations=99, max_tokens=1_000_000)
+    capped = ra.run([incident("A")], trunc, b4, out / "cap", verbose=False)
+    check("an answer stopped by the output cap is marked capped",
+          all(r["capped"] for r in capped))
+    check("and a normal answer is not", not any(r["capped"] for r in recs))
 
     # ---- what must be refused before any money is spent ----
     contaminated = [incident(contaminated=[{"incident_id": "OTHER", "fault": "F3",

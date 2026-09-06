@@ -49,7 +49,8 @@ import ground_truth as gt
 PREREGISTERED_N = 12
 PREREGISTERED_WINS = 4
 
-OUTCOMES = ("correct", "wrong_node", "false_positive", "abstained", "no_contract")
+OUTCOMES = ("correct", "wrong_node", "false_positive", "abstained",
+            "no_contract", "capped")
 
 
 class ScoreError(Exception):
@@ -113,8 +114,12 @@ def join(answers: list[dict], ratings: list[dict], truth: list[dict]) -> list[di
             "fault": label["fault"],
             "fault_role": label.get("node_role"),
             "claimed_cause": answer.get("claimed_cause"),
-            "outcome": outcome(answer.get("claimed_cause"), label["fault"],
-                               label.get("node_role") or ""),
+            # IA-49 criterion 4: a truncated answer is excluded rather than
+            # scored. Calling it wrong would flatter arm A, whose prompt is a
+            # twentieth of the length and which never runs out of room.
+            "outcome": ("capped" if answer.get("capped") else
+                        outcome(answer.get("claimed_cause"), label["fault"],
+                                label.get("node_role") or "")),
             "usefulness": rating.get("usefulness"),
             "described_fault": rating.get("described_fault"),
             "input_tokens": (answer.get("usage") or {}).get("input_tokens"),
@@ -140,6 +145,11 @@ def wins(rows: list[dict]) -> dict:
         by_incident.setdefault(row["incident_id"], {})[row["arm"]] = row["outcome"]
     b_wins, a_wins, tied = [], [], []
     for incident_id, arms in sorted(by_incident.items()):
+        # An incident whose either arm was truncated cannot be compared: the
+        # capped arm was not given room to answer, so a win for the other one
+        # measures the output cap rather than the context.
+        if "capped" in arms.values():
+            continue
         a_ok = arms.get("arm_a") == "correct"
         b_ok = arms.get("arm_b") == "correct"
         if b_ok and not a_ok:
@@ -148,8 +158,9 @@ def wins(rows: list[dict]) -> dict:
             a_wins.append(incident_id)
         else:
             tied.append(incident_id)
+    comparable = len(b_wins) + len(a_wins) + len(tied)
     return {"arm_b": b_wins, "arm_a": a_wins, "tied": tied,
-            "incidents": len(by_incident)}
+            "incidents": comparable, "excluded_capped": len(by_incident) - comparable}
 
 
 def cost(rows: list[dict]) -> dict:
@@ -170,17 +181,21 @@ def render(rows: list[dict]) -> str:
                  "corpus a single")
     lines.append("headline number would mostly measure how many stop faults were "
                  "injected.\n")
-    lines.append("  class  arm    correct  wrong_node  false_pos  abstained  no_contract")
+    lines.append("  class  arm    correct  wrong_node  false_pos  abstained  no_contract  capped")
     for fault in sorted(table):
         for arm in sorted(table[fault]):
             counts = table[fault][arm]
-            lines.append("  %-5s  %-5s  %7d  %10d  %9d  %9d  %11d"
+            lines.append("  %-5s  %-5s  %7d  %10d  %9d  %9d  %11d  %6d"
                          % (fault, arm, counts["correct"], counts["wrong_node"],
                             counts["false_positive"], counts["abstained"],
-                            counts["no_contract"]))
+                            counts["no_contract"], counts["capped"]))
 
     result = wins(rows)
-    lines.append("\nPer-incident comparison over %d incident(s):" % result["incidents"])
+    lines.append("\nPer-incident comparison over %d comparable incident(s):"
+                 % result["incidents"])
+    if result["excluded_capped"]:
+        lines.append("  %d excluded: an arm was truncated by the output cap and "
+                     "was not given room to answer." % result["excluded_capped"])
     lines.append("  arm B correct where arm A was not: %d  %s"
                  % (len(result["arm_b"]), ", ".join(result["arm_b"]) or "-"))
     lines.append("  arm A correct where arm B was not: %d  %s"

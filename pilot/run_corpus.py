@@ -310,7 +310,8 @@ def main(argv=None) -> int:
     if not args.dry_run and not args.skip_preflight:
         reasons = preflight(plan, args.duration)
         if reasons:
-            print("\nRefusing to start. What a 4.2-hour plan can know now:",
+            hours = (rows[-1][3] - rows[0][2]).total_seconds() / 3600
+            print("\nRefusing to start. What a %.1f-hour plan can know now:" % hours,
                   file=sys.stderr)
             for reason in reasons:
                 print("  - %s" % reason, file=sys.stderr)
