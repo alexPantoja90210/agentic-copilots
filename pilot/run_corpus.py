@@ -48,6 +48,34 @@ DEFAULT_PLAN = [("F1", "web"), ("F0", "web"), ("F3", "app"), ("F3", "db")]
 DURATION_MINUTES = 25
 
 
+def parse_plan(spec: str) -> list[tuple[str, str]]:
+    """
+    "F3:app,F3:db" -> [("F3", "app"), ("F3", "db")].
+
+    A plan given on the command line rather than edited into this file. Editing
+    DEFAULT_PLAN to run a subset is how the plan that ran stops matching the
+    plan that was written down -- and IA-45's amendment turns on batch 2's
+    composition being fixed in advance and verifiable afterwards.
+    """
+    plan = []
+    for item in spec.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        if ":" not in item:
+            raise ValueError("expected FAULT:node, got %r" % item)
+        fault, node = (part.strip() for part in item.split(":", 1))
+        if fault not in gt.FAULT_CLASSES:
+            raise ValueError("unknown fault %r; known: %s"
+                             % (fault, ", ".join(sorted(gt.FAULT_CLASSES))))
+        if not node:
+            raise ValueError("no node in %r" % item)
+        plan.append((fault, node))
+    if not plan:
+        raise ValueError("empty plan")
+    return plan
+
+
 def clearance_after(fault: str) -> int:
     """Minutes the next window must wait after this one's window ends."""
     return ib.POST_MINUTES if fault in gt.SIGNAL_FREE_FAULTS else ib.PRE_MINUTES
@@ -253,6 +281,10 @@ def main(argv=None) -> int:
                     help="print the schedule and exit; touches nothing")
     ap.add_argument("--go", action="store_true", help="actually run it")
     ap.add_argument("--duration", type=int, default=DURATION_MINUTES)
+    ap.add_argument("--faults", default=None,
+                    help='the plan, as "F3:app,F3:db". Defaults to DEFAULT_PLAN. '
+                         "Given here rather than edited into the file, so the "
+                         "plan that ran is the plan that was written down.")
     ap.add_argument("--dry-run", action="store_true",
                     help="pass --dry-run to every injection")
     ap.add_argument("--skip-preflight", action="store_true",
@@ -261,7 +293,11 @@ def main(argv=None) -> int:
                          "that using it is a visible choice.")
     args = ap.parse_args(argv)
 
-    plan = DEFAULT_PLAN
+    try:
+        plan = parse_plan(args.faults) if args.faults else DEFAULT_PLAN
+    except ValueError as exc:
+        print("bad --faults: %s" % exc, file=sys.stderr)
+        return 1
     rows = schedule(plan, args.duration)
     print("Clearance: %d min after a fault, %d min after a control "
           "(from incident_builder)." % (ib.PRE_MINUTES, ib.POST_MINUTES))

@@ -250,6 +250,25 @@ def run() -> int:
                                              ec2=FakeEC2(all_up),
                                              cloudwatch=FakeCW(200, history_minutes=15))))
 
+    # ---- a plan given on the command line, not edited into the file --------
+    check("a two-item plan parses",
+          rc.parse_plan("F3:app,F3:db") == [("F3", "app"), ("F3", "db")],
+          str(rc.parse_plan("F3:app,F3:db")))
+    check("whitespace and a trailing comma are tolerated",
+          rc.parse_plan(" F1:web , F0:web , ") == [("F1", "web"), ("F0", "web")])
+    for bad, why in [("F3", "no node"), ("F9:app", "unknown fault"),
+                     ("F3:", "empty node"), ("", "empty plan")]:
+        try:
+            rc.parse_plan(bad)
+            check("%r is refused (%s)" % (bad, why), False, "it parsed")
+        except ValueError:
+            check("%r is refused (%s)" % (bad, why), True)
+
+    # A parsed plan gets the same clearance treatment as the default one.
+    rows = rc.schedule(rc.parse_plan("F3:app,F3:db"), D, start=T0)
+    gap = (rows[1][2] - rows[0][3]).total_seconds() / 60
+    check("a command-line plan is spaced by the same rule", gap == PRE, str(gap))
+
     # ---- the plan itself has to be worth running ---------------------------
     # Two clean F3s survive from the first corpus (IA-61). The plan must add
     # what they lack, or 4.2 hours buys another set of stop faults.
