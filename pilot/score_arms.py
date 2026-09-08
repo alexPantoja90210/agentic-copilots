@@ -57,6 +57,61 @@ class ScoreError(Exception):
     pass
 
 
+def blinding_status(run_dir) -> dict:
+    """
+    Whether this run's console could have named the arms while it was in flight.
+
+    IA-62 criterion 5. Three states, and the third is the one that matters:
+
+      declared false  the runner withheld the arm and the claimed cause. The
+                      usefulness rating from this run may be called blind.
+      declared true   --verbose-arms printed the mapping. The run says so about
+                      itself, which is the entire reason the flag is recorded.
+      not declared    the run predates the fix. Batch 1 is one of these: its
+                      runner printed the mapping and had no way to record it.
+
+    The third case is reported as NOT blind, not as unknown. Absence of a
+    record is not evidence that the thing did not happen -- the same rule
+    incident_builder.py applies to a missing datapoint, applied here to a
+    missing field. A run that cannot show its blinding does not get the benefit
+    of the doubt.
+
+    The accuracy metric is never affected by any of this: `outcome()` is
+    mechanical and no person is in its path.
+    """
+    config_path = Path(run_dir) / "run_config.json"
+    if not config_path.exists():
+        return {"blind": False, "reason":
+                "there is no run_config.json in this run directory, so nothing "
+                "records what the console printed."}
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        return {"blind": False, "reason":
+                "run_config.json could not be read (%s), so nothing records "
+                "what the console printed." % exc}
+    if "verbose_arms" not in config:
+        return {"blind": False, "reason":
+                "this run predates IA-62: its runner printed the arm and the "
+                "claimed cause for every answer as it arrived, and had no field "
+                "in which to record that."}
+    if config["verbose_arms"]:
+        return {"blind": False, "reason":
+                "--verbose-arms was passed: the arm-to-answer mapping was "
+                "printed to the console during the run."}
+    return {"blind": True, "reason":
+            "the runner withheld the arm and the claimed cause from the console."}
+
+
+NOT_BLIND_CAVEAT = (
+    "  !! NOT BLIND: %s\n"
+    "  !! A 1-5 usefulness score given by someone who already knew the arm is\n"
+    "  !! not the measurement IA-45 specified. The numbers above are reported,\n"
+    "  !! not discarded -- the answers are valid and the accuracy scoring is\n"
+    "  !! mechanical and unaffected. Only this secondary metric carries the\n"
+    "  !! caveat, and it carries it everywhere it is quoted.")
+
+
 def outcome(claimed: str | None, fault: str, fault_role: str) -> str:
     """
     One answer against its label. Mechanical: no judgement passes through here.
@@ -174,7 +229,14 @@ def cost(rows: list[dict]) -> dict:
     return out
 
 
-def render(rows: list[dict]) -> str:
+def render(rows: list[dict], blinding: dict | None = None) -> str:
+    """
+    The report. `blinding` comes from `blinding_status()` on the run directory.
+
+    Passing None means the caller did not establish it, and an unestablished
+    blinding is reported as not blind for the same reason as an absent field:
+    the claim is "this rating was blind", and it is on the claim to show it.
+    """
     lines = []
     table = per_class(rows)
     lines.append("Accuracy by fault class. Never pooled: with F3 dominating the "
@@ -214,12 +276,21 @@ def render(rows: list[dict]) -> str:
 
     rated = [row["usefulness"] for row in rows if row["usefulness"] is not None]
     if rated:
+        status = blinding if blinding is not None else {
+            "blind": False,
+            "reason": "the caller did not establish whether this run's console "
+                      "named the arms."}
+        lines.append("\nUsefulness, the secondary metric (IA-45). Rated by a "
+                     "person, so unlike accuracy\nit depends on the rating "
+                     "having been blind:")
         for arm in sorted({row["arm"] for row in rows}):
             scores = [row["usefulness"] for row in rows
                       if row["arm"] == arm and row["usefulness"] is not None]
             if scores:
-                lines.append("\n  %s usefulness: mean %.2f over %d rated"
+                lines.append("  %s usefulness: mean %.2f over %d rated"
                              % (arm, sum(scores) / len(scores), len(scores)))
+        if not status["blind"]:
+            lines.append(NOT_BLIND_CAVEAT % status["reason"])
     else:
         lines.append("\nNo usefulness ratings found. Run --rate first, or the "
                      "secondary metric is simply absent -- which is reported as "
@@ -295,6 +366,11 @@ def main(argv=None) -> int:
                answers_path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
     if args.rate:
+        status = blinding_status(run_dir)
+        if not status["blind"]:
+            print("!! This run's usefulness rating cannot be called blind: %s\n"
+                  "!! Rate it if you want the number, but it will be reported "
+                  "with that caveat.\n" % status["reason"], file=sys.stderr)
         ratings = rate(blind_order(answers, args.seed))
         (run_dir / "ratings.jsonl").write_text(
             "\n".join(json.dumps(r, ensure_ascii=False) for r in ratings) + "\n",
@@ -318,7 +394,7 @@ def main(argv=None) -> int:
     (run_dir / "scored.jsonl").write_text(
         "\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n",
         encoding="utf-8")
-    print(render(rows))
+    print(render(rows, blinding_status(run_dir)))
     print("\nper-answer detail -> %s" % (run_dir / "scored.jsonl"))
     return 0
 

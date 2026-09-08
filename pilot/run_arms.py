@@ -207,7 +207,8 @@ def arm_order(incident_id: str, seed: int) -> tuple:
     return tuple(order)
 
 
-def run(incidents, client, budget, out_dir: Path, verbose=True, seed=0) -> list[dict]:
+def run(incidents, client, budget, out_dir: Path, verbose=True,
+        verbose_arms=False, seed=0) -> list[dict]:
     """
     Ask every incident once per arm, writing each answer as it arrives.
 
@@ -216,6 +217,35 @@ def run(incidents, client, budget, out_dir: Path, verbose=True, seed=0) -> list[
     thrown away eight answers that had already been paid for. IA-49 criterion 1
     says a missing transcript is a missing data point -- it cannot be that if
     the transcripts only exist in memory.
+
+    What the console is allowed to say (IA-62)
+    ------------------------------------------
+    This function used to print one line per ANSWER carrying the arm and the
+    claimed cause. `score_arms.py --rate` then went to considerable trouble to
+    hide exactly that, and the runner had already printed it. Blinding
+    implemented at the scorer while the producer prints the answer key is
+    blinding in one file, not in the system.
+
+    So progress is now reported once per INCIDENT, after both arms are done,
+    and it names the incident and how many answers followed the output
+    contract. Not the arm. Not the claimed cause.
+
+    Per-incident rather than per-answer for a reason that is not obvious:
+    `arm_order` is deterministic in (incident_id, seed) and the seed is written
+    into run_config.json, so two lines printed in the order they were asked
+    would still name the arms to anyone who ran the same one-line function.
+    Withholding the label and leaking the order is the same defect wearing a
+    different hat.
+
+    `verbose_arms=True` restores the old output for debugging. It is recorded
+    in run_config.json by the caller, so a run whose blinding was voided says
+    so in its own artefacts instead of relying on somebody remembering.
+
+    Residual, stated rather than hidden: the capped count is per incident, and
+    arm B's prompt is the long one, so a capped answer is a good guess for arm
+    B. That is the inference score_arms.py already documents -- removing the
+    label hides the name, not the inference. Capped answers are excluded from
+    the comparison anyway.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     answers_path = out_dir / "answers.jsonl"
@@ -223,6 +253,7 @@ def run(incidents, client, budget, out_dir: Path, verbose=True, seed=0) -> list[
     handle = answers_path.open("w", encoding="utf-8")
     try:
         for incident in incidents:
+            here = []
             for arm in arm_order(incident["incident_id"], seed):
                 # A fresh message list every time. Nothing carries between arms,
                 # and nothing carries between incidents.
@@ -248,14 +279,26 @@ def run(incidents, client, budget, out_dir: Path, verbose=True, seed=0) -> list[
                     # (IA-50 scores blind).
                 }
                 records.append(record)
+                here.append(record)
+                # Written and flushed per answer regardless of what is printed:
+                # IA-62 delays the operator SEEING the mapping, it does not
+                # withhold it from the run directory.
                 handle.write(json.dumps(record, ensure_ascii=False) + "\n")
                 handle.flush()
-                if verbose:
-                    print("  %-28s %-5s -> %s%s%s" % (
+                if verbose_arms:
+                    print("  !! %-28s %-5s -> %s%s%s" % (
                         incident["incident_id"], arm,
                         record["claimed_cause"] or "(no ROOT CAUSE line)",
                         "" if record["followed_contract"] else "  CONTRACT NOT FOLLOWED",
                         "  CAPPED" if record["capped"] else ""))
+            if verbose:
+                print("  %-28s  contract %d/%d%s%s" % (
+                    incident["incident_id"],
+                    sum(1 for r in here if r["followed_contract"]), len(here),
+                    "  !! CONTRACT NOT FOLLOWED"
+                    if any(not r["followed_contract"] for r in here) else "",
+                    "  %d CAPPED" % sum(1 for r in here if r["capped"])
+                    if any(r["capped"] for r in here) else ""))
     finally:
         handle.close()
 
@@ -287,6 +330,40 @@ def reconcile(records: list[dict], budget) -> list[str]:
     return problems
 
 
+def run_config(incidents, seed: int, caps: dict, verbose_arms: bool) -> dict:
+    """
+    What the run records about itself, beside its answers.
+
+    A separate function because IA-49 criterion 2 and IA-62 criterion 3 both
+    say a control that lives only in the code cannot be checked against the run
+    it was supposed to bound -- and a control that lives only inside `main()`
+    cannot be checked by a test either.
+    """
+    return {
+        "model": MODEL, "sampling": SAMPLING,
+        "max_output_tokens": MAX_OUTPUT_TOKENS,
+        "caps": caps,
+        "arm_order_seed": seed,
+        "incidents": [i["incident_id"] for i in incidents],
+        "system_prompt": SYSTEM,
+        # IA-62 criterion 3. Written on every run, true or false, because the
+        # useful thing is not the flag but the RECORD: a scorer reading this
+        # directory months later can tell whether the usefulness rating from it
+        # may be called blind, without asking anyone what they remember.
+        "verbose_arms": verbose_arms,
+        "blinding": (
+            "VOIDED: --verbose-arms printed the arm-to-answer mapping to the "
+            "console during this run. The usefulness rating collected from it "
+            "is not blind and must be reported with that caveat. The accuracy "
+            "metric is mechanical and is unaffected."
+            if verbose_arms else
+            "console output withheld the arm and the claimed cause, so the "
+            "usefulness rating may be collected blind. This says nothing about "
+            "what a rater may infer from an answer's own content -- see "
+            "score_arms.py."),
+    }
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--incidents", default=str(DEFAULT_INCIDENTS))
@@ -303,6 +380,12 @@ def main(argv=None) -> int:
                     help="decides which arm is asked first for each incident. "
                          "Recorded in run_config.json so the order can be "
                          "reproduced and audited.")
+    ap.add_argument("--verbose-arms", action="store_true",
+                    help="print which arm produced which answer while the run "
+                         "is in flight. This VOIDS the blind usefulness rating "
+                         "(IA-62) and is recorded in run_config.json so the run "
+                         "declares it rather than depending on memory. The "
+                         "accuracy metric is mechanical and is unaffected.")
     ap.add_argument("--allow-unusable", action="store_true",
                     help="run against a corpus the checks reject. There is no "
                          "good reason; it exists so that using it is a visible "
@@ -364,18 +447,20 @@ def main(argv=None) -> int:
     # file: IA-49 criterion 2. A cap that lives only in the code cannot be
     # checked against the run it was supposed to bound.
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "run_config.json").write_text(json.dumps({
-        "model": MODEL, "sampling": SAMPLING,
-        "max_output_tokens": MAX_OUTPUT_TOKENS,
-        "caps": {"iterations": len(incidents) * len(ARMS) + 1,
-                 "tokens": args.max_tokens, "usd": args.max_usd},
-        "arm_order_seed": args.seed,
-        "incidents": [i["incident_id"] for i in incidents],
-        "system_prompt": SYSTEM,
-    }, indent=2, ensure_ascii=False), encoding="utf-8")
+    (out_dir / "run_config.json").write_text(json.dumps(
+        run_config(incidents, args.seed,
+                   {"iterations": len(incidents) * len(ARMS) + 1,
+                    "tokens": args.max_tokens, "usd": args.max_usd},
+                   args.verbose_arms),
+        indent=2, ensure_ascii=False), encoding="utf-8")
 
     print()
-    records = run(incidents, anthropic.Anthropic(), budget, out_dir, seed=args.seed)
+    if args.verbose_arms:
+        print("!! --verbose-arms: the arm-to-answer mapping will be printed. "
+              "The usefulness\n!! rating from this run is NOT blind, and "
+              "run_config.json records that.\n", file=sys.stderr)
+    records = run(incidents, anthropic.Anthropic(), budget, out_dir,
+                  verbose_arms=args.verbose_arms, seed=args.seed)
 
     problems = reconcile(records, budget)
     if problems:
@@ -398,7 +483,11 @@ def main(argv=None) -> int:
               "as wrong would flatter arm A, whose prompt never runs out."
               % len(capped), file=sys.stderr)
     print("\n%d answers -> %s" % (len(records), out_dir))
-    print("Scoring is IA-50 and is done blind: the answers carry no label.")
+    print("Scoring is IA-50 and is done blind: the answers carry no label, and "
+          "this console\nnamed neither the arm nor the claimed cause (IA-62)."
+          if not args.verbose_arms else
+          "Scoring is IA-50. The usefulness rating from this run is NOT blind: "
+          "--verbose-arms\nprinted the mapping above. run_config.json says so too.")
     return 0
 
 

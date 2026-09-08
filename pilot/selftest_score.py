@@ -14,6 +14,10 @@ The second is the one worth having. A scorer that will happily produce
 
 from __future__ import annotations
 
+import json
+import tempfile
+from pathlib import Path
+
 import score_arms as sa
 
 PASS, FAIL = "PASS", "FAIL"
@@ -151,6 +155,71 @@ def run() -> int:
           set(table) == {"F3", "F1", "F0"}, str(sorted(table)))
     check("and the control's false positive lands in the control's row",
           table["F0"]["arm_b"]["false_positive"] == 1, str(table["F0"]))
+
+    # ---- IA-62 criterion 5: a rating that was not blind says so -----------
+    #
+    # The point of these checks is the third case. A run directory that carries
+    # no `verbose_arms` field was produced before the fix -- batch 1 is one --
+    # and its runner printed the mapping with no way to record that it had.
+    # Reporting that as "unknown", or defaulting it to blind, would let the one
+    # run we KNOW was compromised pass as clean.
+    scratch = Path(tempfile.mkdtemp())
+
+    missing = scratch / "no-config"
+    missing.mkdir()
+    check("a run directory with no config cannot claim a blind rating",
+          sa.blinding_status(missing)["blind"] is False)
+
+    def with_config(name, config):
+        directory = scratch / name
+        directory.mkdir()
+        (directory / "run_config.json").write_text(
+            json.dumps(config), encoding="utf-8")
+        return directory
+
+    legacy = with_config("legacy", {"model": "m", "arm_order_seed": 1})
+    check("a run that predates IA-62 is reported NOT blind, not unknown",
+          sa.blinding_status(legacy)["blind"] is False)
+    check("and it says why, naming the runner that printed the mapping",
+          "predates IA-62" in sa.blinding_status(legacy)["reason"],
+          sa.blinding_status(legacy)["reason"])
+
+    voided = with_config("voided", {"verbose_arms": True})
+    check("a run that used --verbose-arms is reported NOT blind",
+          sa.blinding_status(voided)["blind"] is False,
+          sa.blinding_status(voided)["reason"])
+
+    clean = with_config("clean", {"verbose_arms": False})
+    check("a run whose console withheld the arms may be called blind",
+          sa.blinding_status(clean)["blind"] is True,
+          sa.blinding_status(clean)["reason"])
+
+    # ---- and the caveat travels with the number, not with the run directory
+    rated_answers, rated_labels, ratings = [], [], []
+    for index, (iid, arm) in enumerate([("A", "arm_a"), ("A", "arm_b")]):
+        rated_labels.append(truth(iid, "F3", "db"))
+        rated_answers.append(answer(iid, arm, "db"))
+        ratings.append({"token": "R%03d" % index, "usefulness": 4,
+                        "described_fault": "stopped"})
+    rated_labels = [truth("A", "F3", "db")]
+    rated_rows = sa.join(rated_answers, ratings, rated_labels)
+
+    compromised = sa.render(rated_rows, sa.blinding_status(legacy))
+    check("the report marks a non-blind usefulness rating as NOT BLIND",
+          "NOT BLIND" in compromised, compromised)
+    check("and reports the number anyway rather than discarding it",
+          "usefulness: mean 4.00" in compromised, compromised)
+    check("and says the accuracy metric is unaffected",
+          "mechanical" in compromised, compromised)
+
+    honest = sa.render(rated_rows, sa.blinding_status(clean))
+    check("a genuinely blind rating carries no caveat",
+          "NOT BLIND" not in honest, honest)
+
+    # A caller that does not establish blinding does not get the benefit of the
+    # doubt: the claim is "this was blind", and it is on the claim to show it.
+    check("an unestablished blinding is reported as not blind",
+          "NOT BLIND" in sa.render(rated_rows), sa.render(rated_rows))
 
     width = max(len(n) for n, _, _ in results)
     failed = 0

@@ -15,6 +15,8 @@ asked and answers from a script.
 
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -287,6 +289,67 @@ def run() -> int:
           written["incident_id"] == "F3-db-1" and "answer" in written)
     check("and the budget report travels with them",
           (out / "r1" / "budget.json").exists())
+
+    # ---- IA-62: the console must not be the answer key ---------------------
+    #
+    # The defect this replaces was not found by a test. It could not have been:
+    # every check above passes verbose=False, because the alternative is a suite
+    # that prints twelve answers on each run. The blind spot and the convenience
+    # had the same cause, so the fix has to be tested with printing switched ON.
+    #
+    # The claimed causes here are deliberately words that appear nowhere else in
+    # the incident -- "zebra" is the cause node, but the incident id is "INC-1",
+    # so a substring check for a leaked cause cannot be satisfied by the id.
+    talkative = FakeClient(["a.\nROOT CAUSE: zebra", "b.\nROOT CAUSE: quokka"])
+    b5 = ab.RunBudget(ra.MODEL, max_iterations=10, max_tokens=1_000_000)
+    console = io.StringIO()
+    with contextlib.redirect_stdout(console):
+        blind_recs = ra.run([incident("INC-1", "F3", "zebra")], talkative, b5,
+                            out / "blind", verbose=True)
+    printed = console.getvalue()
+
+    check("the default console names the incident", "INC-1" in printed, printed)
+    check("and says whether the output contract was followed",
+          "contract 2/2" in printed, printed)
+    check("and never names an arm",
+          "arm_a" not in printed and "arm_b" not in printed, printed)
+    check("and never prints a claimed cause",
+          all(r["claimed_cause"] not in printed for r in blind_recs), printed)
+    check("one line per incident, not one per answer -- the ask order is "
+          "reproducible from the seed, so printing in order names the arms too",
+          printed.strip().count("\n") == 0, printed)
+
+    # IA-62 criterion 2: withheld from the console, not from the run directory.
+    on_disk = [json.loads(line) for line in
+               (out / "blind" / "answers.jsonl").read_text(
+                   encoding="utf-8").splitlines() if line.strip()]
+    check("the mapping is still written to answers.jsonl in full",
+          {r["arm"] for r in on_disk} == {"arm_a", "arm_b"}
+          and {r["claimed_cause"] for r in on_disk} == {"zebra", "quokka"},
+          str(on_disk))
+
+    # ---- and the debugging escape hatch actually does what it says ---------
+    loud_client = FakeClient(["a.\nROOT CAUSE: zebra", "b.\nROOT CAUSE: quokka"])
+    b6 = ab.RunBudget(ra.MODEL, max_iterations=10, max_tokens=1_000_000)
+    loud = io.StringIO()
+    with contextlib.redirect_stdout(loud):
+        ra.run([incident("INC-1", "F3", "zebra")], loud_client, b6,
+               out / "loud", verbose=True, verbose_arms=True)
+    loud_text = loud.getvalue()
+    check("--verbose-arms restores the mapping for debugging",
+          "arm_a" in loud_text and "arm_b" in loud_text
+          and "zebra" in loud_text and "quokka" in loud_text, loud_text)
+
+    # ---- IA-62 criterion 3: the run declares its own blinding --------------
+    caps = {"iterations": 3, "tokens": 1000, "usd": 1.0}
+    quiet_cfg = ra.run_config([incident("INC-1")], 7, caps, verbose_arms=False)
+    loud_cfg = ra.run_config([incident("INC-1")], 7, caps, verbose_arms=True)
+    check("run_config records verbose_arms on every run, not only when used",
+          quiet_cfg["verbose_arms"] is False and loud_cfg["verbose_arms"] is True,
+          str((quiet_cfg.get("verbose_arms"), loud_cfg.get("verbose_arms"))))
+    check("and a run whose blinding was voided says so in its own artefacts",
+          "VOIDED" in loud_cfg["blinding"] and "VOIDED" not in quiet_cfg["blinding"],
+          loud_cfg["blinding"])
 
     width = max(len(n) for n, _, _ in results)
     failed = 0
