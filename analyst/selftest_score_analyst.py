@@ -147,17 +147,46 @@ def run(baseline_path: Path) -> int:
     check("and no USD figure appears anywhere in the economics",
           not any("usd" in k.lower() for k in econ), str(list(econ)))
 
-    # ---- a truncated run is refused whole, not scored around --------------
-    clean = [rec("O1", "16"), rec("O3", "53.365")]
-    check("a run with no truncation is scorable",
-          sc.refuse_if_truncated(clean) == [])
-    cut = clean + [dict(rec("O9", None), truncated=True)]
-    refusal = sc.refuse_if_truncated(cut)
-    check("one truncated question refuses the WHOLE run", len(refusal) == 1, str(refusal))
-    check("and the refusal says it is an instrument failure, not an agent one",
-          "instrument failures, not agent failures" in refusal[0], refusal[0])
+    # ---- the two integrity questions are answered separately --------------
+    def run_of(obj_ok=13, sub_ok=10, obj_cut=(), sub_cut=()):
+        rs = [dict(rec("O%d" % i, "x"), truncated="O%d" % i in obj_cut)
+              for i in range(1, obj_ok + 1)]
+        rs += [dict(rec("S%d" % i, "x", kind="subjective"),
+                    truncated="S%d" % i in sub_cut) for i in range(1, sub_ok + 1)]
+        return rs
+
+    whole = sc.run_integrity(run_of())
+    check("a complete clean run is scorable and H3 is evaluable",
+          whole["accuracy_scorable"] and whole["h3_evaluable"], str(whole))
+
+    obj_hurt = sc.run_integrity(run_of(obj_cut=("O9",)))
+    check("a truncated OBJECTIVE question blocks the accuracy verdict",
+          obj_hurt["accuracy_scorable"] is False, str(obj_hurt))
+    check("and the reason says an instrument failure is not an agent failure",
+          "instrument failure" in obj_hurt["blocking"][0], obj_hurt["blocking"][0])
+
+    short = sc.run_integrity(run_of(obj_ok=11))
+    check("a run missing objective questions blocks it too — the denominator "
+          "would move",
+          short["accuracy_scorable"] is False and "denominator" in short["blocking"][0],
+          str(short))
+
+    # Run 2's actual shape: objective clean, subjective damaged.
+    real = sc.run_integrity(run_of(sub_ok=9, sub_cut=("S1", "S5", "S6", "S7")))
+    check("subjective damage does NOT block the accuracy verdict — the frozen "
+          "criterion is 11 of 13 objective",
+          real["accuracy_scorable"] is True, str(real))
+    check("but it DOES make H3 unevaluable, and both facts are reported",
+          real["h3_evaluable"] is False and len(real["caveats"]) == 2, str(real))
     check("truncated is not a seventh outcome — the frozen vocabulary is still six",
           len(sc.OUTCOMES) == 6 and "truncated" not in sc.OUTCOMES, str(sc.OUTCOMES))
+
+    rendered_caveat = sc.render(sc.score([rec("O1", "16")], baseline),
+                                sc.tokenomics(sc.score([rec("O1", "16")], baseline)),
+                                {"preregistration_commit": "abc", "harness": {}},
+                                baseline, real)
+    check("and the report says in capitals that H3 is not evaluated",
+          "H3 IS NOT EVALUATED BY THIS RUN" in rendered_caveat, rendered_caveat[:200])
 
     # ---- the verdict is read, not negotiated ------------------------------
     passing = [rec("O%d" % i, "x") for i in range(1, 14)]

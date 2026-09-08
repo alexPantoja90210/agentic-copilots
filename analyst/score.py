@@ -253,31 +253,68 @@ def tokenomics(rows: list[dict]) -> dict:
     }
 
 
-def refuse_if_truncated(records: list[dict]) -> list[str]:
+EXPECTED_OBJECTIVE = 13
+EXPECTED_SUBJECTIVE = 10
+
+
+def run_integrity(records: list[dict]) -> dict:
     """
-    A run whose instrument cut questions short is not scorable. Full stop.
+    What this run can and cannot answer. Two questions, not one.
 
-    `truncated` is deliberately NOT a seventh outcome. The pre-registration
-    froze six, and adding one would be changing a rule after seeing a run. A
-    truncated question is not a badly-scored answer — it is a question with no
-    answer because the harness stopped it, which is a fact about the instrument
-    and not about the agent.
+    ## Why this replaced an all-or-nothing refusal, 8 Sep 2026
 
-    Nor is it excluded and scored around. Excluding it would move the
-    denominator: "11 of 13" quietly becomes "11 of 11", and the success
-    criterion is loosened by the back door without anyone deciding to loosen it.
+    The first version refused to score a run if ANY question was truncated. Run 2
+    then finished with all 13 objective questions clean and the damage confined
+    to the subjective half: four truncated at the 20-exchange cap, and S10 never
+    asked because the account ran out of API credit mid-run.
 
-    So the whole run is refused, in the same shape as the incident pilot's
-    scorer refusing a verdict below its pre-registered sample size. A smaller
-    honest answer beats a bigger dishonest one.
+    Relaxing a refusal immediately after seeing that relaxing it produces a
+    verdict is a suspicious act, and it is recorded as one. Here is why it holds
+    anyway:
+
+    **The frozen pre-registration already drew this line.** §7 says the success
+    criterion is 11 of 13 OBJECTIVE questions, and that the ten subjective ones
+    "are not scored numerically and do not enter this criterion". The
+    all-or-nothing refusal was therefore STRICTER than the frozen document
+    required. Bringing the code into line with the document is not loosening the
+    document.
+
+    **And the split is honest about what is lost.** The accuracy verdict is
+    answerable because the questions it depends on all completed. H3 is NOT
+    answerable, because it depends on the subjective half, and that half is
+    damaged. Reporting the first while claiming the second would be the real
+    offence; refusing both would discard a result the frozen rules entitle us to.
+
+    The change was made after seeing which half broke. That is written here so a
+    reader can judge the move rather than take it on trust.
     """
-    hit = [r["id"] for r in records if r.get("truncated")]
-    if not hit:
-        return []
-    return ["%d question(s) were truncated by the harness while the agent was "
-            "still working: %s. These are instrument failures, not agent "
-            "failures, and scoring them as either would misreport the run. No "
-            "verdict is given." % (len(hit), ", ".join(hit))]
+    obj = [r for r in records if r.get("kind") == "objective"]
+    sub = [r for r in records if r.get("kind") == "subjective"]
+    obj_cut = [r["id"] for r in obj if r.get("truncated")]
+    sub_cut = [r["id"] for r in sub if r.get("truncated")]
+    obj_missing = EXPECTED_OBJECTIVE - len(obj)
+    sub_missing = EXPECTED_SUBJECTIVE - len(sub)
+
+    blocking = []
+    if obj_cut:
+        blocking.append("%d objective question(s) were truncated by the harness: "
+                        "%s. An instrument failure cannot be scored as an agent "
+                        "failure." % (len(obj_cut), ", ".join(obj_cut)))
+    if obj_missing > 0:
+        blocking.append("%d objective question(s) were never asked. The criterion "
+                        "is 11 of 13; scoring a shorter run against it would move "
+                        "the denominator." % obj_missing)
+
+    caveats = []
+    if sub_cut:
+        caveats.append("%d subjective question(s) truncated at the exchange cap: "
+                       "%s." % (len(sub_cut), ", ".join(sub_cut)))
+    if sub_missing > 0:
+        caveats.append("%d subjective question(s) never asked." % sub_missing)
+
+    return {"accuracy_scorable": not blocking, "blocking": blocking,
+            "h3_evaluable": not caveats, "caveats": caveats,
+            "objective_asked": len(obj), "subjective_asked": len(sub)}
 
 
 def resolution_audit(expected: dict) -> list[dict]:
@@ -337,7 +374,7 @@ def verdict(rows: list[dict], threshold: int = 11, of: int = 13) -> str:
 _BASELINE: list = []
 
 
-def render(rows, econ, config, baseline=None) -> str:
+def render(rows, econ, config, baseline=None, integrity=None) -> str:
     _BASELINE[:] = [baseline] if baseline else []
     out = []
     obj = [r for r in rows if r["kind"] == "objective"]
@@ -399,6 +436,16 @@ def render(rows, econ, config, baseline=None) -> str:
                "analysis, with the differences named.\n"
                % econ["subjective"]["questions"])
 
+    if integrity is not None and not integrity["h3_evaluable"]:
+        out.append("\n\nH3 IS NOT EVALUATED BY THIS RUN.\n")
+        for c in integrity["caveats"]:
+            out.append("  - %s" % c)
+        out.append("\n  H3 predicts how the agent behaves on the open-ended "
+                   "questions, and that half\n  of the run is damaged. The "
+                   "accuracy verdict below stands on the 13 objective\n  "
+                   "questions, which completed clean. The prediction stays "
+                   "unrun and open.")
+
     out.append("\n" + verdict(rows))
     out.append("\nRules: PREREGISTRATION.md at commit %s"
                % (config.get("preregistration_commit", "?")[:12]))
@@ -428,14 +475,13 @@ def main(argv=None) -> int:
         print("REFUSED: %s" % exc, file=sys.stderr)
         return 1
 
-    refusals = refuse_if_truncated(answers)
-    if refusals:
+    integrity = run_integrity(answers)
+    if not integrity["accuracy_scorable"]:
         print("REFUSING TO SCORE THIS RUN", file=sys.stderr)
-        for reason in refusals:
+        for reason in integrity["blocking"]:
             print("  - %s" % reason, file=sys.stderr)
-        print("\nRaise MAX_EXCHANGES in run_agent.py and run again. Keep this "
-              "run directory: a discarded run is evidence too, and deleting it "
-              "makes the discard unverifiable.", file=sys.stderr)
+        print("\nKeep this run directory: a discarded run is evidence too, and "
+              "deleting it makes the discard unverifiable.", file=sys.stderr)
         return 2
 
     rows = score(answers, baseline)
@@ -445,7 +491,7 @@ def main(argv=None) -> int:
         encoding="utf-8")
     (run_dir / "tokenomics.json").write_text(
         json.dumps(econ, indent=2), encoding="utf-8")
-    print(render(rows, econ, config, baseline))
+    print(render(rows, econ, config, baseline, integrity))
     print("\nper-answer detail -> %s" % (run_dir / "scored.jsonl"))
     return 0
 
