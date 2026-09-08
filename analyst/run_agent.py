@@ -517,11 +517,28 @@ def main(argv=None) -> int:
     print("\n" + budget.summary())
     truncated = [r for r in records if r["truncated"]]
     if truncated:
-        print("\n!! %d question(s) were TRUNCATED BY THIS HARNESS at the %d-exchange "
-              "cap while the agent was still working: %s.\n!! These are NOT agent "
-              "failures. The run is not scorable: score.py will refuse a verdict.\n"
-              "!! Raise MAX_EXCHANGES and run again, and keep this run rather than "
-              "deleting it."
+        # IA-72. This message used to end "Raise MAX_EXCHANGES and run again",
+        # unconditionally. That was written for run 1, where the 8-exchange cap
+        # was plainly too low and no result had been seen yet. Once results
+        # exist, raising the cap buys completion at the price of comparability,
+        # and deciding that is a decision about the PRE-REGISTRATION, which this
+        # runner does not own and cannot read. It also claimed the run was not
+        # scorable, which stopped being true when run_integrity() split the
+        # accuracy verdict from the H3 question: a run whose damage is confined
+        # to the subjective half is still scorable for accuracy.
+        #
+        # So: report, and point at the document. Do not prescribe.
+        print("\n!! %d question(s) were TRUNCATED BY THIS HARNESS at the "
+              "%d-exchange cap while the agent was still working: %s.\n"
+              "!! These are NOT agent failures.\n"
+              "!! Whether this run is scorable depends on WHICH questions were "
+              "cut. Run score.py — run_integrity() decides, and it answers "
+              "accuracy and H3 separately.\n"
+              "!! Whether the cap may be raised is a question about the "
+              "pre-registration, not about this run. See PREREGISTRATION.md and "
+              "H3_PROTOCOL.md before changing it: raising a cap after seeing "
+              "which answers it cut is not a neutral act.\n"
+              "!! Keep this run either way. A truncated transcript is evidence."
               % (len(truncated), MAX_EXCHANGES,
                  ", ".join(r["id"] for r in truncated)), file=sys.stderr)
     broke = [r for r in records if r["no_contract"]]

@@ -244,6 +244,28 @@ def run() -> int:
     check("the console says the harness truncated it, not that the agent failed",
           "TRUNCATED BY THE HARNESS" in console.getvalue(), console.getvalue())
 
+    # ---- IA-72: the end-of-run warning must not prescribe raising the cap --
+    # It used to end "Raise MAX_EXCHANGES and run again", unconditionally. The
+    # runner cannot know whether that is allowed - it is a decision about the
+    # pre-registration - and it also claimed the run was not scorable, which
+    # stopped being true when run_integrity() split accuracy from H3. The
+    # warning lives in main(), so it is checked at the source rather than by
+    # driving a whole run.
+    source = Path(ra.__file__).read_text(encoding="utf-8")
+    warning = source[source.index("were TRUNCATED BY THIS HARNESS"):]
+    warning = warning[:warning.index("file=sys.stderr")]
+    check("the truncation warning no longer tells the operator to raise the cap",
+          "Raise MAX_EXCHANGES" not in warning,
+          "the instrument would be advising a protocol violation")
+    check("it points at the pre-registration instead of prescribing",
+          "PREREGISTRATION.md" in warning)
+    check("and it stops claiming the whole run is unscorable",
+          "run_integrity" in warning,
+          "damage confined to the subjective half still leaves accuracy scorable")
+    check("it still says truncation is not an agent failure",
+          "NOT agent failures" in warning)
+    check("and it still says to keep the run", "Keep this run" in warning)
+
     quiet = FakeClient([Response([Block(type="text", text="It is about 53.")])])
     b6 = ab.RunBudget(ra.MODEL, max_iterations=20, max_tokens=1_000_000)
     with contextlib.redirect_stdout(io.StringIO()):
