@@ -243,6 +243,14 @@ def ask(client, question: dict, tickets, agents, budget) -> dict:
     """One question, one fresh conversation, tools available, everything logged."""
     messages = [{"role": "user", "content": build_prompt(question)}]
     calls, exchanges, text = [], 0, ""
+    # Tokens per QUESTION, not only per run. The budget tracks the total, and a
+    # total cannot answer the question this project now cares about: what each
+    # architecture rung costs and whether it bought anything. Tokens per correct
+    # answer, and the gap between the bounded questions and the open ones, are
+    # both invisible without this. Added as a MEASUREMENT after IA-68 closed;
+    # it changes nothing about what counts as a correct answer, so the frozen
+    # pre-registration is untouched.
+    tokens_in = tokens_out = 0
     started = time.time()
 
     while exchanges < MAX_EXCHANGES:
@@ -252,6 +260,9 @@ def ask(client, question: dict, tickets, agents, budget) -> dict:
             model=MODEL, max_tokens=MAX_OUTPUT_TOKENS, system=SYSTEM,
             tools=at.TOOLS, messages=messages)
         budget.record_response(response)
+        usage = getattr(response, "usage", None)
+        tokens_in += getattr(usage, "input_tokens", 0) or 0
+        tokens_out += getattr(usage, "output_tokens", 0) or 0
         exchanges += 1
 
         text = "".join(b.text for b in response.content
@@ -278,6 +289,13 @@ def ask(client, question: dict, tickets, agents, budget) -> dict:
         "asked_at": datetime.now(timezone.utc).isoformat(),
         "seconds": round(time.time() - started, 2),
         "exchanges": exchanges,
+        "input_tokens": tokens_in,
+        "output_tokens": tokens_out,
+        # Every tool result is appended to the conversation, so input tokens
+        # grow with each exchange. This is what makes a rung expensive, and it
+        # is why the ratio matters more than the total.
+        "tokens_per_exchange": round((tokens_in + tokens_out) / exchanges, 1)
+                               if exchanges else 0,
         "tool_calls": len(calls),
         "calls": calls,
         "reply": text,
@@ -304,8 +322,9 @@ def run(questions, client, tickets, agents, budget, out_dir: Path,
             if verbose:
                 # IA-62: the question and whether the contract was followed.
                 # Not the answer. Not the value. Watchable, not an answer key.
-                print("  %-4s %-11s %2d tool call(s)  %5.1fs  contract %s%s"
+                print("  %-4s %-11s %2d tool call(s)  %6d tok  %5.1fs  contract %s%s"
                       % (record["id"], record["kind"], record["tool_calls"],
+                         record["input_tokens"] + record["output_tokens"],
                          record["seconds"],
                          "ok" if record["followed_contract"] else "NOT FOLLOWED",
                          "  (abstained)" if record["abstained"] else ""))

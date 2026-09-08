@@ -173,6 +173,13 @@ def run() -> int:
     check("the answer is captured", rec["answer"] == "4.0", str(rec["answer"]))
     check("the contract is recorded as followed", rec["followed_contract"] is True)
     check("wall-clock seconds are recorded", isinstance(rec["seconds"], float))
+    # Tokens per question, not only per run: a total cannot say what a rung
+    # costs or what a correct answer costs.
+    check("input and output tokens are recorded per question",
+          rec["input_tokens"] == 1800 and rec["output_tokens"] == 240,
+          "%r / %r" % (rec["input_tokens"], rec["output_tokens"]))
+    check("and tokens per exchange, which is what makes a rung expensive",
+          rec["tokens_per_exchange"] == 1020.0, str(rec["tokens_per_exchange"]))
     check("each question is its own conversation, with no history carried in",
           client.calls[0]["messages"][0]["role"] == "user"
           and len(client.calls[0]["messages"]) == 1, str(len(client.calls[0]["messages"])))
