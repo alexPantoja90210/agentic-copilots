@@ -247,7 +247,18 @@ def run() -> int:
     check("and a mismatch between budget and transcripts is reported",
           ra.reconcile([rec4_bad], b4) != [])
 
-    cfg = ra.run_config([q], scratch, "deadbeef", {"usd": 5.0})
+    # ---- the instrument names itself, not only its rules ------------------
+    harness = ra.head_commit(scratch)
+    check("head_commit reports rather than raising outside a repository",
+          isinstance(harness, dict) and "commit" in harness, str(harness))
+    cfg = ra.run_config([q], scratch, "deadbeef", {"usd": 5.0},
+                        {"commit": "cafe1234", "analyst_tree_dirty": True,
+                         "uncommitted": [" M analyst/run_agent.py"]})
+    check("run_config records the harness commit, so answers can be traced to "
+          "the code that produced them",
+          cfg["harness"]["commit"] == "cafe1234", str(cfg.get("harness")))
+    check("and records a dirty tree rather than silently allowing it",
+          cfg["harness"]["analyst_tree_dirty"] is True, str(cfg.get("harness")))
     check("run_config records the pre-registration commit",
           cfg["preregistration_commit"] == "deadbeef")
     check("and the tool list, so the architecture rung is on the record",

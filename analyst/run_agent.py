@@ -81,6 +81,35 @@ class RunError(Exception):
     pass
 
 
+def head_commit(repo_root: Path) -> dict:
+    """
+    The commit the harness itself is running from, and whether the tree is dirty.
+
+    The run already refuses unless the RULES are committed. Recording the
+    rules while leaving the INSTRUMENT unnamed is the same principle applied to
+    half the problem: answers produced by uncommitted code cannot be traced to
+    the version that produced them, and "we changed something afterwards" is
+    then unfalsifiable.
+
+    A dirty tree does not stop the run — sometimes an operator genuinely wants a
+    scratch run — but it is recorded, so a run whose instrument was not pinned
+    says so in its own artefacts rather than relying on memory. Same shape as
+    IA-62's verbose_arms flag.
+    """
+    try:
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_root),
+                              capture_output=True, text=True, timeout=20)
+        dirty = subprocess.run(["git", "status", "--porcelain", "--", "analyst"],
+                               cwd=str(repo_root), capture_output=True,
+                               text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"commit": None, "dirty": None, "error": str(exc)}
+    changed = [line for line in dirty.stdout.splitlines() if line.strip()]
+    return {"commit": head.stdout.strip() or None,
+            "analyst_tree_dirty": bool(changed),
+            "uncommitted": changed}
+
+
 def preregistration_commit(repo_root: Path) -> str:
     """
     The commit that last touched PREREGISTRATION.md.
@@ -274,7 +303,7 @@ def reconcile(records: list[dict], budget) -> list[str]:
     return problems
 
 
-def run_config(questions, out_dir, prereg_commit, caps) -> dict:
+def run_config(questions, out_dir, prereg_commit, caps, harness=None) -> dict:
     return {
         "model": MODEL, "sampling": SAMPLING,
         "max_output_tokens": MAX_OUTPUT_TOKENS,
@@ -282,6 +311,8 @@ def run_config(questions, out_dir, prereg_commit, caps) -> dict:
         "caps": caps,
         "cost_cap_note": COST_CAP_NOTE,
         "preregistration_commit": prereg_commit,
+        # IA-68: the instrument names itself too, not only its rules.
+        "harness": harness or {},
         "tools": [t["name"] for t in at.TOOLS],
         "questions": [q["id"] for q in questions],
         "system_prompt": SYSTEM,
@@ -320,6 +351,11 @@ def main(argv=None) -> int:
     print("%d question(s): %d objective, %d subjective. Model %s."
           % (len(questions), objective, len(questions) - objective, MODEL))
     print("  pre-registration commit %s" % prereg[:12])
+    harness = head_commit(here.parent)
+    print("  harness commit          %s%s"
+          % ((harness.get("commit") or "unknown")[:12],
+             "  !! analyst/ HAS UNCOMMITTED CHANGES — this run will record that"
+             if harness.get("analyst_tree_dirty") else ""))
     print("  corpus %d tickets x %d agents" % (len(tickets), len(agents)))
     print("  prompts leak-checked against baseline.json: clean")
     print("  cost cap $%.2f — %s" % (args.max_usd, COST_CAP_NOTE))
@@ -350,7 +386,8 @@ def main(argv=None) -> int:
                           max_output_per_call=MAX_OUTPUT_TOKENS)
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "run_config.json").write_text(
-        json.dumps(run_config(questions, out_dir, prereg, caps), indent=2,
+        json.dumps(run_config(questions, out_dir, prereg, caps,
+                              head_commit(here.parent)), indent=2,
                    ensure_ascii=False), encoding="utf-8")
 
     print()
