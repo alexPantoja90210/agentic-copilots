@@ -223,6 +223,34 @@ def run() -> int:
     check("an abstention is flagged and still counts as following the contract",
           rec4["abstained"] is True and rec4["followed_contract"] is True)
 
+    # ---- truncation is not the same thing as breaking the contract --------
+    # The first full run reported eleven "contract NOT FOLLOWED" and every one
+    # was this harness cutting the agent off mid-work. Two situations reported
+    # as one, in the field that decides whether the agent complied.
+    talker = FakeClient([Response(
+        [Block(type="text", text="still working"),
+         Block(type="tool_use", id="t%d" % i, name="run_query",
+               input={"expression": "len(tickets)"})], "tool_use")
+        for i in range(ra.MAX_EXCHANGES + 2)])
+    b5 = ab.RunBudget(ra.MODEL, max_iterations=200, max_tokens=5_000_000)
+    console = io.StringIO()
+    with contextlib.redirect_stdout(console):
+        cut = ra.run([q], talker, tickets, agents, b5, scratch / "cut")[0]
+    check("an agent stopped at the exchange cap is marked truncated",
+          cut["truncated"] is True, str(cut)[:160])
+    check("and NOT no_contract — that field is reserved for the agent finishing "
+          "without an ANSWER line",
+          cut["no_contract"] is False, str(cut)[:160])
+    check("the console says the harness truncated it, not that the agent failed",
+          "TRUNCATED BY THE HARNESS" in console.getvalue(), console.getvalue())
+
+    quiet = FakeClient([Response([Block(type="text", text="It is about 53.")])])
+    b6 = ab.RunBudget(ra.MODEL, max_iterations=20, max_tokens=1_000_000)
+    with contextlib.redirect_stdout(io.StringIO()):
+        ended = ra.run([q], quiet, tickets, agents, b6, scratch / "ended")[0]
+    check("an agent that finishes with no ANSWER line IS no_contract",
+          ended["no_contract"] is True and ended["truncated"] is False, str(ended)[:160])
+
     # ---- the leak check on prompts ----------------------------------------
     ref = scratch / "reference"
     ref.mkdir()

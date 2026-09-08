@@ -253,6 +253,33 @@ def tokenomics(rows: list[dict]) -> dict:
     }
 
 
+def refuse_if_truncated(records: list[dict]) -> list[str]:
+    """
+    A run whose instrument cut questions short is not scorable. Full stop.
+
+    `truncated` is deliberately NOT a seventh outcome. The pre-registration
+    froze six, and adding one would be changing a rule after seeing a run. A
+    truncated question is not a badly-scored answer — it is a question with no
+    answer because the harness stopped it, which is a fact about the instrument
+    and not about the agent.
+
+    Nor is it excluded and scored around. Excluding it would move the
+    denominator: "11 of 13" quietly becomes "11 of 11", and the success
+    criterion is loosened by the back door without anyone deciding to loosen it.
+
+    So the whole run is refused, in the same shape as the incident pilot's
+    scorer refusing a verdict below its pre-registered sample size. A smaller
+    honest answer beats a bigger dishonest one.
+    """
+    hit = [r["id"] for r in records if r.get("truncated")]
+    if not hit:
+        return []
+    return ["%d question(s) were truncated by the harness while the agent was "
+            "still working: %s. These are instrument failures, not agent "
+            "failures, and scoring them as either would misreport the run. No "
+            "verdict is given." % (len(hit), ", ".join(hit))]
+
+
 def resolution_audit(expected: dict) -> list[dict]:
     """
     For every question with a rejected reading, can the scorer actually tell the
@@ -400,6 +427,16 @@ def main(argv=None) -> int:
     except OSError as exc:
         print("REFUSED: %s" % exc, file=sys.stderr)
         return 1
+
+    refusals = refuse_if_truncated(answers)
+    if refusals:
+        print("REFUSING TO SCORE THIS RUN", file=sys.stderr)
+        for reason in refusals:
+            print("  - %s" % reason, file=sys.stderr)
+        print("\nRaise MAX_EXCHANGES in run_agent.py and run again. Keep this "
+              "run directory: a discarded run is evidence too, and deleting it "
+              "makes the discard unverifiable.", file=sys.stderr)
+        return 2
 
     rows = score(answers, baseline)
     econ = tokenomics(rows)

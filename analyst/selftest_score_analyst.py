@@ -147,6 +147,18 @@ def run(baseline_path: Path) -> int:
     check("and no USD figure appears anywhere in the economics",
           not any("usd" in k.lower() for k in econ), str(list(econ)))
 
+    # ---- a truncated run is refused whole, not scored around --------------
+    clean = [rec("O1", "16"), rec("O3", "53.365")]
+    check("a run with no truncation is scorable",
+          sc.refuse_if_truncated(clean) == [])
+    cut = clean + [dict(rec("O9", None), truncated=True)]
+    refusal = sc.refuse_if_truncated(cut)
+    check("one truncated question refuses the WHOLE run", len(refusal) == 1, str(refusal))
+    check("and the refusal says it is an instrument failure, not an agent one",
+          "instrument failures, not agent failures" in refusal[0], refusal[0])
+    check("truncated is not a seventh outcome — the frozen vocabulary is still six",
+          len(sc.OUTCOMES) == 6 and "truncated" not in sc.OUTCOMES, str(sc.OUTCOMES))
+
     # ---- the verdict is read, not negotiated ------------------------------
     passing = [rec("O%d" % i, "x") for i in range(1, 14)]
     for row in sc.score(passing, baseline):

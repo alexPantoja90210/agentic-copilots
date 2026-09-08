@@ -45,9 +45,23 @@ import agent_tools as at
 MODEL = os.environ.get("PILOT_MODEL", "claude-sonnet-4-5")
 MAX_OUTPUT_TOKENS = 1500
 
-# Per question. A question that has not resolved in this many exchanges is
-# recorded as `no_contract` rather than being allowed to spend without bound.
-MAX_EXCHANGES = 8
+# Per question, and this number has already been wrong once.
+#
+# At 8, the first full run truncated ELEVEN of 23 questions — every one of them
+# still working, none of them refusing to answer. The console reported
+# "contract NOT FOLLOWED" for all eleven, which read as an agent that would not
+# follow instructions and was in fact the harness cutting it off. Two situations
+# reported as one: the recurring defect, this time in the field that decides
+# whether the agent complied.
+#
+# Raised to 20 and, more importantly, truncation is now recorded and reported as
+# ITSELF. If a question still truncates, the run says so and the scorer refuses
+# a verdict rather than counting an instrument failure against the agent.
+#
+# Note for anyone reading the cost: a cap set too low does not save money. The
+# eleven truncated questions consumed about 185,000 tokens and produced nothing
+# usable. Everything spent up to a premature cap is spent for nothing.
+MAX_EXCHANGES = 20
 
 SAMPLING = "model default; temperature not exposed by the installed SDK"
 
@@ -302,7 +316,12 @@ def ask(client, question: dict, tickets, agents, budget) -> dict:
         "answer": answer,
         # An absent answer is recorded as absent. It is never written as an
         # empty value, which a scorer could not tell from a legitimate blank.
+        # Three states, not two. `truncated` means the harness stopped the agent
+        # while it was still working; `no_contract` means the agent finished and
+        # wrote no ANSWER line. Only the second is something the agent did.
+        "truncated": exchanges >= MAX_EXCHANGES and answer is None,
         "followed_contract": answer is not None,
+        "no_contract": answer is None and exchanges < MAX_EXCHANGES,
         "abstained": bool(answer and answer.strip().upper().startswith("CANNOT COMPUTE")),
         "hit_exchange_cap": exchanges >= MAX_EXCHANGES and answer is None,
     }
@@ -326,7 +345,9 @@ def run(questions, client, tickets, agents, budget, out_dir: Path,
                       % (record["id"], record["kind"], record["tool_calls"],
                          record["input_tokens"] + record["output_tokens"],
                          record["seconds"],
-                         "ok" if record["followed_contract"] else "NOT FOLLOWED",
+                         "ok" if record["followed_contract"]
+                         else "!! TRUNCATED BY THE HARNESS" if record["truncated"]
+                         else "no ANSWER line",
                          "  (abstained)" if record["abstained"] else ""))
     finally:
         handle.close()
@@ -454,10 +475,19 @@ def main(argv=None) -> int:
             print("!!   %s" % problem, file=sys.stderr)
 
     print("\n" + budget.summary())
-    broke = [r for r in records if not r["followed_contract"]]
+    truncated = [r for r in records if r["truncated"]]
+    if truncated:
+        print("\n!! %d question(s) were TRUNCATED BY THIS HARNESS at the %d-exchange "
+              "cap while the agent was still working: %s.\n!! These are NOT agent "
+              "failures. The run is not scorable: score.py will refuse a verdict.\n"
+              "!! Raise MAX_EXCHANGES and run again, and keep this run rather than "
+              "deleting it."
+              % (len(truncated), MAX_EXCHANGES,
+                 ", ".join(r["id"] for r in truncated)), file=sys.stderr)
+    broke = [r for r in records if r["no_contract"]]
     if broke:
-        print("\n!! %d answer(s) did not end with an ANSWER line. Recorded as "
-              "such, not repaired." % len(broke), file=sys.stderr)
+        print("\n!! %d answer(s) finished without an ANSWER line. That IS the agent, "
+              "and it is recorded as such, not repaired." % len(broke), file=sys.stderr)
     no_tools = [r for r in records if r["tool_calls"] == 0]
     if no_tools:
         print("!! %d answer(s) were produced with no tool call. The scorer will "
