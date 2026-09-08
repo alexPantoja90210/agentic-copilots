@@ -29,6 +29,7 @@ commit hash is written into run_config.json.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -371,9 +372,31 @@ def reconcile(records: list[dict], budget) -> list[str]:
     return problems
 
 
-def run_config(questions, out_dir, prereg_commit, caps, harness=None) -> dict:
+def corpus_fingerprint(corpus: Path) -> dict:
+    """
+    Which corpus this run actually read. The H3 arm (IA-70) runs the same
+    questions, the same prompts and the same caps against a DIFFERENT corpus,
+    so the corpus is the only thing that distinguishes the two runs. A run that
+    does not record it cannot be told apart from its own control afterwards.
+    """
+    out = {"path": str(corpus)}
+    for name in ("tickets.csv", "agents.csv"):
+        h = hashlib.sha256()
+        with open(corpus / name, "rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                h.update(chunk)
+        out[name] = h.hexdigest()[:16]
+    manifest = corpus / "manifest.json"
+    if manifest.exists():
+        out["manifest"] = json.loads(manifest.read_text(encoding="utf-8"))
+    return out
+
+
+def run_config(questions, out_dir, prereg_commit, caps, harness=None,
+               corpus=None) -> dict:
     return {
         "model": MODEL, "sampling": SAMPLING,
+        "corpus": corpus or {},
         "max_output_tokens": MAX_OUTPUT_TOKENS,
         "max_exchanges_per_question": MAX_EXCHANGES,
         "caps": caps,
@@ -397,6 +420,10 @@ def main(argv=None) -> int:
     ap.add_argument("--reference", default=r"C:\dev\ia-analyst\reference")
     ap.add_argument("--out", default=None)
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--only", default=None,
+                    help="comma-separated question ids, e.g. S2,S3,S4,S8,S9. "
+                         "Unlike --limit, which takes a prefix of the list, "
+                         "this names the questions and refuses on a typo.")
     ap.add_argument("--plan", action="store_true")
     ap.add_argument("--go", action="store_true")
     ap.add_argument("--max-tokens", type=int, default=2_000_000)
@@ -406,6 +433,17 @@ def main(argv=None) -> int:
     reference, corpus = Path(args.reference), Path(args.corpus)
     try:
         questions = load_questions(reference)
+        if args.only:
+            wanted = [q.strip() for q in args.only.split(",") if q.strip()]
+            known = {q["id"] for q in questions}
+            missing = [q for q in wanted if q not in known]
+            if missing:
+                # A silently dropped id would shrink the arm without saying so,
+                # and the run would look complete. Refuse instead.
+                raise RunError("unknown question id(s): %s" % ", ".join(missing))
+            order = {q: i for i, q in enumerate(wanted)}
+            questions = sorted((q for q in questions if q["id"] in order),
+                               key=lambda q: order[q["id"]])
         if args.limit:
             questions = questions[:args.limit]
         assert_no_leak([build_prompt(q) for q in questions], reference)
@@ -430,7 +468,8 @@ def main(argv=None) -> int:
     if ignored:
         print("  (%d untracked non-source file(s) under analyst/, not part of "
               "the instrument: %s)" % (len(ignored), ", ".join(ignored[:3])))
-    print("  corpus %d tickets x %d agents" % (len(tickets), len(agents)))
+    print("  corpus %d tickets x %d agents  <- %s"
+          % (len(tickets), len(agents), corpus))
     print("  prompts leak-checked against baseline.json: clean")
     print("  cost cap $%.2f — %s" % (args.max_usd, COST_CAP_NOTE))
 
@@ -461,7 +500,8 @@ def main(argv=None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "run_config.json").write_text(
         json.dumps(run_config(questions, out_dir, prereg, caps,
-                              head_commit(here.parent)), indent=2,
+                              head_commit(here.parent),
+                              corpus_fingerprint(corpus)), indent=2,
                    ensure_ascii=False), encoding="utf-8")
 
     print()
