@@ -16,3 +16,4 @@ incident_brief.md
 # is public. The example teaches the schema; the live file would leak inventory.
 ops-triage/signals.live.json
 ops-triage/signals.*.live.json
+.idea/

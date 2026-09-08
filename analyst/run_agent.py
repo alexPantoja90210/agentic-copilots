@@ -81,33 +81,61 @@ class RunError(Exception):
     pass
 
 
+# What counts as part of the instrument. An untracked .py under analyst/ could
+# be a module the run imports; an untracked .idea/ file cannot.
+INSTRUMENT_SUFFIXES = (".py", ".md", ".json")
+
+
 def head_commit(repo_root: Path) -> dict:
     """
-    The commit the harness itself is running from, and whether the tree is dirty.
+    The commit the harness is running from, and whether the INSTRUMENT is pinned.
 
-    The run already refuses unless the RULES are committed. Recording the
-    rules while leaving the INSTRUMENT unnamed is the same principle applied to
-    half the problem: answers produced by uncommitted code cannot be traced to
-    the version that produced them, and "we changed something afterwards" is
-    then unfalsifiable.
+    The run already refuses unless the RULES are committed. Recording the rules
+    while leaving the instrument unnamed applies the principle to half the
+    problem: answers produced by uncommitted code cannot be traced to the
+    version that produced them.
 
-    A dirty tree does not stop the run — sometimes an operator genuinely wants a
-    scratch run — but it is recorded, so a run whose instrument was not pinned
-    says so in its own artefacts rather than relying on memory. Same shape as
-    IA-62's verbose_arms flag.
+    The first version of this asked `git status --porcelain -- analyst` and
+    called any output dirty. It then reported the instrument unpinned because
+    PyCharm had written `analyst/.idea/`. That is the recurring defect again --
+    a check that cannot distinguish two situations it treats as one -- and it
+    is the kind that matters most here, because a warning that fires on IDE
+    noise is a warning the operator learns to scroll past.
+
+    So the three cases are separated and all three are recorded:
+
+      tracked_modified   source under analyst/ changed since its commit
+      untracked_source   a new .py/.md/.json that the run might be importing
+      untracked_other    everything else, reported and NOT counted as dirty
+
+    A dirty tree still does not stop the run. It is recorded, so a run whose
+    instrument was not pinned says so in its own artefacts.
     """
     try:
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(repo_root),
                               capture_output=True, text=True, timeout=20)
-        dirty = subprocess.run(["git", "status", "--porcelain", "--", "analyst"],
-                               cwd=str(repo_root), capture_output=True,
-                               text=True, timeout=20)
+        status = subprocess.run(["git", "status", "--porcelain", "--", "analyst"],
+                                cwd=str(repo_root), capture_output=True,
+                                text=True, timeout=20)
     except (OSError, subprocess.SubprocessError) as exc:
-        return {"commit": None, "dirty": None, "error": str(exc)}
-    changed = [line for line in dirty.stdout.splitlines() if line.strip()]
-    return {"commit": head.stdout.strip() or None,
-            "analyst_tree_dirty": bool(changed),
-            "uncommitted": changed}
+        return {"commit": None, "analyst_tree_dirty": None, "error": str(exc)}
+
+    tracked, new_source, other = [], [], []
+    for line in status.stdout.splitlines():
+        if not line.strip():
+            continue
+        path = line[3:].strip().strip('"')
+        if line.startswith("??"):
+            (new_source if path.endswith(INSTRUMENT_SUFFIXES) else other).append(path)
+        else:
+            tracked.append(path)
+    return {
+        "commit": head.stdout.strip() or None,
+        "tracked_modified": tracked,
+        "untracked_source": new_source,
+        "untracked_other": other,
+        "analyst_tree_dirty": bool(tracked or new_source),
+    }
 
 
 def preregistration_commit(repo_root: Path) -> str:
@@ -354,8 +382,14 @@ def main(argv=None) -> int:
     harness = head_commit(here.parent)
     print("  harness commit          %s%s"
           % ((harness.get("commit") or "unknown")[:12],
-             "  !! analyst/ HAS UNCOMMITTED CHANGES — this run will record that"
+             "  !! INSTRUMENT NOT PINNED: %s"
+             % ", ".join(harness.get("tracked_modified", [])
+                         + harness.get("untracked_source", []))
              if harness.get("analyst_tree_dirty") else ""))
+    ignored = harness.get("untracked_other") or []
+    if ignored:
+        print("  (%d untracked non-source file(s) under analyst/, not part of "
+              "the instrument: %s)" % (len(ignored), ", ".join(ignored[:3])))
     print("  corpus %d tickets x %d agents" % (len(tickets), len(agents)))
     print("  prompts leak-checked against baseline.json: clean")
     print("  cost cap $%.2f — %s" % (args.max_usd, COST_CAP_NOTE))

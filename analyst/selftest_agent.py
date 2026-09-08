@@ -251,6 +251,40 @@ def run() -> int:
     harness = ra.head_commit(scratch)
     check("head_commit reports rather than raising outside a repository",
           isinstance(harness, dict) and "commit" in harness, str(harness))
+
+    # The distinction that the first version could not make: IDE metadata is
+    # not an unpinned instrument, and a new module is.
+    import subprocess as sp
+    repo = Path(tempfile.mkdtemp())
+    (repo / "analyst").mkdir()
+    for cmd in (["git", "init", "-q"], ["git", "config", "user.email", "t@t"],
+                ["git", "config", "user.name", "t"]):
+        sp.run(cmd, cwd=str(repo), capture_output=True)
+    (repo / "analyst" / "run_agent.py").write_text("x = 1\n", encoding="utf-8")
+    sp.run(["git", "add", "-A"], cwd=str(repo), capture_output=True)
+    sp.run(["git", "commit", "-qm", "init"], cwd=str(repo), capture_output=True)
+    check("a clean analyst tree is reported pinned",
+          ra.head_commit(repo)["analyst_tree_dirty"] is False,
+          str(ra.head_commit(repo)))
+
+    (repo / "analyst" / ".idea").mkdir()
+    (repo / "analyst" / ".idea" / "misc.xml").write_text("<x/>", encoding="utf-8")
+    ide = ra.head_commit(repo)
+    check("untracked IDE metadata does NOT make the instrument unpinned",
+          ide["analyst_tree_dirty"] is False, str(ide))
+    check("but it is still reported rather than hidden",
+          any(".idea" in p for p in ide["untracked_other"]), str(ide))
+
+    (repo / "analyst" / "helper.py").write_text("y = 2\n", encoding="utf-8")
+    newmod = ra.head_commit(repo)
+    check("an untracked .py DOES make the instrument unpinned — the run might "
+          "be importing it",
+          newmod["analyst_tree_dirty"] is True, str(newmod))
+
+    (repo / "analyst" / "run_agent.py").write_text("x = 2\n", encoding="utf-8")
+    edited = ra.head_commit(repo)
+    check("and a modified tracked source file does too",
+          any("run_agent.py" in p for p in edited["tracked_modified"]), str(edited))
     cfg = ra.run_config([q], scratch, "deadbeef", {"usd": 5.0},
                         {"commit": "cafe1234", "analyst_tree_dirty": True,
                          "uncommitted": [" M analyst/run_agent.py"]})
